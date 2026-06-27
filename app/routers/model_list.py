@@ -10,28 +10,19 @@ router = APIRouter()
 MODEL_MAP: dict[str, str] = {
     # Google
     "gemini-3-flash-preview":  "google",
-    "gemini-2.0-flash":        "google",
-    "gemini-2.5-pro":          "google",
-    "gemini-2.5-flash":        "google",
+    "google/gemma-4-31b-it:free":        "google",
+    "sarvam-30b":          "Professor.Lai",
+    "sarvam-105b":        "Professor.Lai",
     # OpenAI
-    "gpt-4o":                  "openai",
-    "gpt-4o-mini":             "openai",
-    "o3-mini":                 "openai",
-    "o4-mini":                 "openai",
+    "qwen/qwen3-vl-30b-a3b-thinking":                  "qwen",
+    "nvidia/nemotron-nano-12b-v2-vl":             "nvidia",
+    "deepseek/deepseek-v3.2":                 "dicksuck",
+    "deepseek/deepseek-chat-v3-0324":                 "dicksuck",
     # Anthropic
-    "claude-sonnet-4-5":       "anthropic",
-    "claude-opus-4":           "anthropic",
+    "sonar":           "Professor.Lai",
     # Meta
-    "llama-3.1-70b":           "meta",
+    "meta-llama/llama-4-scout-17b-16e-instruct":           "meta",
     # xAI
-    "grok-3":                  "xai",
-    "grok-3-mini":             "xai",
-    # DeepSeek
-    "deepseek-r1":             "deepseek",
-    "deepseek-v3":             "deepseek",
-    # Mistral
-    "mistral-large":           "mistral",
-    "codestral":               "mistral",
 }
 
 SUPPORTED_MODELS = list(MODEL_MAP.keys())
@@ -55,7 +46,7 @@ async def list_models():
                 "id":         m,
                 "object":     "model",
                 "created":    1700000000,
-                "owned_by":   "Cosverse",
+                "owned_by":   "Professor.Lai",
             }
             for m in SUPPORTED_MODELS
         ],
