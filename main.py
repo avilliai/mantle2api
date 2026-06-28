@@ -52,7 +52,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 # ─────────────────────────── 定时保活 ────────────────────
 # 保活间隔：每 2 小时执行一次 session 检查 + 失效账号重新登录
-KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "7200"))
+KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "10000"))
 
 _ka_log = logging.getLogger("cosverse_proxy.keepalive")
 

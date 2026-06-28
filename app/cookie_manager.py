@@ -217,7 +217,7 @@ class CookieManager:
         return {"success": success, "failed": failed}
 
     # ── 定时保活（供 main.py 后台任务调用）───────────────
-    KEEPALIVE_CONCURRENCY = int(os.environ.get("KEEPALIVE_CONCURRENCY", "20"))
+    KEEPALIVE_CONCURRENCY = int(os.environ.get("KEEPALIVE_CONCURRENCY", "10"))
 
     async def keepalive_tick(self) -> None:
         """
