@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import threading
 from typing import Optional
 
@@ -189,30 +190,50 @@ class CookieManager:
         return {"success": success, "failed": failed}
 
     # ── 定时保活（供 main.py 后台任务调用）───────────────
+    KEEPALIVE_CONCURRENCY = int(os.environ.get("KEEPALIVE_CONCURRENCY", "5"))
+
     async def keepalive_tick(self) -> None:
         """
         每次定时触发时调用：
-        1. 先检查所有账号的 session 是否仍然有效
-        2. 对 session 已失效的账号触发保活（重新登录）
-        3. 检查备用账号是否充足
+        1. 对所有未禁用且未超额的账号无条件并行保活（重新登录拿新 cookie）
+        2. 检查备用账号是否充足
+
+        check_session 无法可靠判断存活状态，因此直接全量保活，
+        由 CosverseRefresher 内部决定是否真的需要重新登录。
         """
         log.info("⏰ keepalive_tick 开始")
 
-        # 第一步：session 检查
         with self._sync_lock:
             candidates = [
                 a for a in self.accounts
                 if not a.disabled and a.usage_count < ACCOUNT_MAX_USAGE
             ]
 
-        for acc in candidates:
-            alive = await self.check_session(acc)
-            if not alive:
-                log.warning(f"[{acc.email}] session 已失效，触发保活...")
-                await self.refresh_account(acc)
-            await asyncio.sleep(3)   # 错峰
+        if not candidates:
+            log.info("⏰ 无需保活的候选账号，跳过。")
+            await self._ensure_spare_accounts()
+            log.info("⏰ keepalive_tick 完成")
+            return
 
-        # 第二步：确保备用账号充足
+        log.info(f"⏰ 开始并行保活，目标账号数: {len(candidates)}，并发度: {self.KEEPALIVE_CONCURRENCY}")
+
+        sem = asyncio.Semaphore(self.KEEPALIVE_CONCURRENCY)
+        counter = {"ok": 0, "fail": 0}
+
+        async def _bounded_refresh(acc):
+            async with sem:
+                ok = await self.refresh_account(acc)
+                if ok:
+                    counter["ok"] += 1
+                else:
+                    counter["fail"] += 1
+
+        await asyncio.gather(*[_bounded_refresh(a) for a in candidates])
+
+        log.info(
+            f"⏰ 并行保活完成：成功 {counter['ok']}，失败 {counter['fail']}，共 {len(candidates)} 个"
+        )
+
         await self._ensure_spare_accounts()
         log.info("⏰ keepalive_tick 完成")
 
