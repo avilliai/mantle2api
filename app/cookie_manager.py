@@ -43,6 +43,9 @@ class CookieManager:
                     # 恢复 email_jwt（保活时收 OTP 必须）
                     if d.get("email_jwt"):
                         acc.email_jwt = d["email_jwt"]
+                    # 恢复 reset_at（24h 配额重置时间戳）
+                    if d.get("reset_at"):
+                        acc.reset_at = d["reset_at"]
                     accounts.append(acc)
                 self.accounts = accounts
             log.info(f"✅ 成功加载账号: {len(self.accounts)} 个")
@@ -59,6 +62,10 @@ class CookieManager:
                     email_jwt = getattr(acc, "email_jwt", "")
                     if email_jwt:
                         d["email_jwt"] = email_jwt
+                    # reset_at：24h 配额重置时间戳
+                    reset_at = getattr(acc, "reset_at", 0)
+                    if reset_at:
+                        d["reset_at"] = reset_at
                     raw.append(d)
                 TOKENS_FILE.write_text(
                     json.dumps(raw, ensure_ascii=False, indent=4), encoding="utf-8"
@@ -71,25 +78,33 @@ class CookieManager:
 
     # ── 提供给管理后台接口的数据 ──────────────────────────
     def get_tokens_detail(self) -> dict:
+        import time
         tokens_list = []
         total_remaining = 0
         alive_count = 0
+        now = time.time()
 
         with self._sync_lock:
             for acc in self.accounts:
-                remaining = max(0, ACCOUNT_MAX_USAGE - acc.usage_count)
+                # 计算剩余量时考虑 24h 重置：若已过 24h，usage 视为 0
+                reset_at  = getattr(acc, "reset_at", 0) or 0
+                effective_usage = acc.usage_count if (now - reset_at < 86400) else 0
+                remaining = max(0, ACCOUNT_MAX_USAGE - effective_usage)
                 total_remaining += remaining
 
                 if acc.healthy and not acc.disabled and remaining > 0:
                     alive_count += 1
 
+                next_reset_in = max(0, int(86400 - (now - reset_at))) if reset_at else None
+
                 tokens_list.append({
-                    "index":      acc.index,
-                    "email":      acc.email,
-                    "token_hint": getattr(acc, "token_hint", acc.email),
-                    "is_alive":   acc.healthy,
-                    "disabled":   acc.disabled,
-                    "remaining":  remaining,
+                    "index":         acc.index,
+                    "email":         acc.email,
+                    "token_hint":    getattr(acc, "token_hint", acc.email),
+                    "is_alive":      acc.healthy,
+                    "disabled":      acc.disabled,
+                    "remaining":     remaining,
+                    "next_reset_in": next_reset_in,   # 距下次重置的秒数
                 })
 
         return {
@@ -252,6 +267,10 @@ class CookieManager:
     # ── 轮询获取可用账号 ──────────────────────────────────
     async def get_next(self) -> AccountState:
         async with self._async_lock:
+            # 顺便对所有账号做一次 24h 重置检查，解禁已满额但已过期的账号
+            for a in self.accounts:
+                self._maybe_reset_usage(a)
+
             valid = [
                 a for a in self.accounts
                 if a.healthy and not a.disabled and a.usage_count < ACCOUNT_MAX_USAGE
@@ -317,7 +336,32 @@ class CookieManager:
         raise HTTPException(500, "换号重试失败：无备用账号且自动注册/保活均未成功")
 
     # ── 用量记账 ──────────────────────────────────────────
+    def _maybe_reset_usage(self, acc: AccountState) -> None:
+        """
+        如果距离上次重置已超过 24h，将 usage_count 归零并重新启用账号。
+        reset_at 字段记录上次重置的 Unix 时间戳（秒），持久化在 tokens.json 中。
+        """
+        import time
+        now = time.time()
+        reset_at = getattr(acc, "reset_at", 0) or 0
+        if now - reset_at >= 86400:  # 24 小时 = 86400 秒
+            if acc.usage_count > 0 or acc.disabled:
+                log.info(
+                    f"[{acc.email}] ♻️  24h 配额重置 "
+                    f"(距上次重置 {int((now - reset_at) / 3600)}h)，"
+                    f"usage_count {acc.usage_count} → 0"
+                )
+            acc.usage_count = 0
+            acc.reset_at    = now
+            # 仅因额度耗尽而被禁用的账号（healthy=True），重置后自动解禁
+            if acc.disabled and acc.healthy:
+                acc.disabled = False
+                log.info(f"[{acc.email}] ♻️  额度已重置，自动解禁")
+
     def record_usage(self, acc: AccountState) -> None:
+        # 先检查是否需要重置 24h 配额
+        self._maybe_reset_usage(acc)
+
         if hasattr(acc, "increment_usage"):
             acc.increment_usage()
         else:

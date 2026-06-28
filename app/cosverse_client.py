@@ -21,6 +21,11 @@ from app.email_service import EmailService
 log = logging.getLogger("cosverse_proxy.client")
 IMPERSONATE = "chrome110"
 
+
+class EmptyResponseError(RuntimeError):
+    """流式响应内容为空（content_tokens=0），视作 cookie 过期或账号异常。"""
+    pass
+
 R2_UPLOAD_URL = f"{COSVERSE_WEB}/api/r2-upload"
 
 
@@ -409,7 +414,7 @@ class CosverseRefresher(_LoginMixin):
 
     async def _recover_email_jwt(self) -> str:
         """
-        当 AccountState 里没有保存 email_jwt 时，
+        当 AccountState 里没有保存 email_jwt，或已知 JWT 过期时，
         通过管理员接口按邮箱名查 address_id，再调 show_password 取回 JWT。
         网络超时时不抛出异常，直接返回空字符串。
         """
@@ -426,10 +431,52 @@ class CosverseRefresher(_LoginMixin):
             if jwt:
                 log.info(f"[{self.email}] 成功取回 email_jwt")
                 self.acc.email_jwt = jwt
+                self._email_jwt = jwt
             return jwt or ""
         except Exception as e:
             log.warning(f"[{self.email}] 取回 email_jwt 失败: {e}")
             return ""
+
+    async def _ensure_valid_email_jwt(self) -> str:
+        """
+        验证当前 email_jwt 是否可用（能正常拉到邮件列表），
+        不可用（过期/无效）时自动重新获取一次。
+        返回可用的 JWT 或空字符串。
+        """
+        if not self._email_jwt:
+            log.warning(f"[{self.email}] 无 email_jwt，尝试从邮件服务恢复...")
+            return await self._recover_email_jwt()
+
+        # 快速探测：尝试拉取邮件列表，401/403 → JWT 已过期
+        try:
+            from app.email_service import EmailService as ES
+            import asyncio
+            es = ES()
+
+            def _probe(jwt: str):
+                import requests
+                res = requests.get(
+                    f"https://{es.worker_domain}/api/mails",
+                    params={"limit": 1, "offset": 0},
+                    headers={"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"},
+                    timeout=8,
+                    verify=False,
+                )
+                return res.status_code
+
+            status = await asyncio.wait_for(
+                asyncio.to_thread(_probe, self._email_jwt),
+                timeout=12,
+            )
+            if status in (200,):
+                return self._email_jwt  # JWT 仍然有效
+
+            log.warning(f"[{self.email}] email_jwt 探测返回 {status}，视为过期，重新获取...")
+        except Exception as e:
+            log.warning(f"[{self.email}] email_jwt 探测异常: {e}，尝试重新获取...")
+
+        # JWT 过期或探测失败 → 重新获取
+        return await self._recover_email_jwt()
 
     async def run(self) -> bool:
         """
@@ -439,10 +486,8 @@ class CosverseRefresher(_LoginMixin):
         try:
             self._cfg = await fetch_action_config()
 
-            # 确保有邮箱 JWT 才能收 OTP
-            if not self._email_jwt:
-                log.warning(f"[{self.email}] AccountState 中无 email_jwt，尝试从邮件服务恢复...")
-                self._email_jwt = await self._recover_email_jwt()
+            # 确保有可用的邮箱 JWT（自动处理缺失和过期两种情况）
+            self._email_jwt = await self._ensure_valid_email_jwt()
             if not self._email_jwt:
                 raise RuntimeError(
                     f"无法获取 email_jwt（账号 {self.email} 注册时未保存，"
@@ -603,6 +648,8 @@ async def stream_cosverse_response(
 ) -> AsyncIterator[str]:
     """
     向 Cosverse /api/chat 发送请求并流式返回文本块。
+    若响应 HTTP 200 但所有 chunk 内容为空（completion_tokens=0），
+    抛出 EmptyResponseError，由调用方触发 refresh + 重试逻辑。
     """
     if conv_id is None:
         conv_id = _random_conv_id()
@@ -634,6 +681,7 @@ async def stream_cosverse_response(
         if resp.status_code not in (200, 201):
             raise RuntimeError(f"Cosverse /api/chat 返回 {resp.status_code}")
 
+        yielded_any = False
         async for raw_line in resp.aiter_lines():
             line = (
                 raw_line.decode("utf-8", errors="ignore")
@@ -649,6 +697,87 @@ async def stream_cosverse_response(
                 except Exception:
                     pass
                 if chunk:
+                    yielded_any = True
                     yield chunk
             elif line.startswith("e:") or line.startswith("d:"):
-                return
+                break
+
+        # HTTP 200 但无任何有效文本块 → 视为 cookie 过期 / 账号异常
+        if not yielded_any:
+            raise EmptyResponseError(f"empty_response:{acc.email}")
+
+# ── 带重试的对话入口（供 chat router 调用）────────────────
+
+async def stream_with_retry(
+    text: str,
+    model: str,
+    provider: str,
+    attachments: Optional[list[dict]] = None,
+    conv_id: Optional[str] = None,
+) -> AsyncIterator[str]:
+    """
+    带自动重试的流式对话入口。
+    失败策略：
+      1. 当前账号空响应或 cookie 过期 → 对该账号执行 refresh，重试一次；
+      2. refresh 后重试仍失败 → 切换到号池中的下一个账号，再重试一次；
+      3. 连换两个账号都失败 → 注册新账号加入号池，用新账号再试；
+      4. 新账号仍失败 → 抛出最终异常。
+    """
+    from app.cookie_manager import cm
+
+    _TRANSIENT_ERRORS = (PermissionError, EmptyResponseError)
+
+    async def _try_stream(acc: AccountState) -> AsyncIterator[str]:
+        """直接迭代并 yield，异常向上抛出。"""
+        async for chunk in stream_cosverse_response(
+            text, acc, model, provider, attachments, conv_id
+        ):
+            yield chunk
+
+    async def _refresh_and_retry(acc: AccountState) -> AsyncIterator[str]:
+        """对 acc 执行 refresh，成功则重试流式请求，失败则抛出。"""
+        log.warning(f"[{acc.email}] 触发 refresh 后重试...")
+        ok = await cm.refresh_account(acc)
+        if not ok:
+            raise RuntimeError(f"[{acc.email}] refresh 失败，无法重试")
+        async for chunk in _try_stream(acc):
+            yield chunk
+
+    # ── 第一次尝试 ──────────────────────────────────────
+    acc = await cm.get_next()
+    try:
+        async for chunk in _try_stream(acc):
+            yield chunk
+        return
+    except _TRANSIENT_ERRORS as e:
+        log.warning(f"首次请求失败（{type(e).__name__}）: {e}")
+
+    # ── 第二次：对同一账号 refresh 后重试 ───────────────
+    try:
+        async for chunk in _refresh_and_retry(acc):
+            yield chunk
+        return
+    except Exception as e:
+        log.warning(f"refresh 后重试仍失败: {e}")
+
+    # ── 第三次：换备用账号 ──────────────────────────────
+    try:
+        acc2 = await cm.mark_failed_and_get_replacement(acc, reason="empty_or_expired", attempt=2)
+        async for chunk in _try_stream(acc2):
+            yield chunk
+        return
+    except _TRANSIENT_ERRORS as e:
+        log.warning(f"备用账号（{acc2.email}）也失败: {e}")
+    except Exception as e:
+        log.warning(f"切换备用账号异常: {e}")
+
+    # ── 第四次：注册新账号 ──────────────────────────────
+    log.warning("两个账号均失败，尝试注册新账号...")
+    try:
+        acc3 = await cm.mark_failed_and_get_replacement(acc, reason="all_failed", attempt=3)
+        async for chunk in _try_stream(acc3):
+            yield chunk
+        return
+    except Exception as e:
+        log.error(f"注册新账号后仍失败: {e}")
+        raise RuntimeError("所有重试策略均已耗尽，对话请求失败") from e
