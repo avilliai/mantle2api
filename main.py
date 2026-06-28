@@ -66,7 +66,8 @@ async def keep_alive_task():
       3. 检查备用账号数量是否低于阈值，不足时触发注册。
     """
     # 启动后先等待一个完整周期，避免刚加载就立刻跑保活
-    _ka_log.info(f"⏳ 保活任务已启动，首次执行将在 {KEEPALIVE_INTERVAL // 60} 分钟后")
+    await cm.keepalive_tick()
+    _ka_log.info(f"⏳ 保活任务已启动，执行间隔将在 {KEEPALIVE_INTERVAL // 60} 分钟后")
     await asyncio.sleep(KEEPALIVE_INTERVAL)
 
     while True:
