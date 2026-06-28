@@ -411,15 +411,20 @@ class CosverseRefresher(_LoginMixin):
         """
         当 AccountState 里没有保存 email_jwt 时，
         通过管理员接口按邮箱名查 address_id，再调 show_password 取回 JWT。
+        网络超时时不抛出异常，直接返回空字符串。
         """
         try:
             from app.email_service import EmailService as ES
+            import asyncio
             es = ES()
             name = self.email.split("@")[0]
-            jwt, _ = es.recover_email_jwt(name)
+            # 整体限时 20s，避免单次超时拖垮保活流程
+            jwt, _ = await asyncio.wait_for(
+                asyncio.to_thread(es.recover_email_jwt, name),
+                timeout=20,
+            )
             if jwt:
                 log.info(f"[{self.email}] 成功取回 email_jwt")
-                # 写回 AccountState 避免下次重复查询
                 self.acc.email_jwt = jwt
             return jwt or ""
         except Exception as e:
@@ -436,9 +441,14 @@ class CosverseRefresher(_LoginMixin):
 
             # 确保有邮箱 JWT 才能收 OTP
             if not self._email_jwt:
+                log.warning(f"[{self.email}] AccountState 中无 email_jwt，尝试从邮件服务恢复...")
                 self._email_jwt = await self._recover_email_jwt()
             if not self._email_jwt:
-                raise RuntimeError("无法获取 email_jwt，无法收取 OTP 验证码")
+                raise RuntimeError(
+                    f"无法获取 email_jwt（账号 {self.email} 注册时未保存，"
+                    f"且通过管理员接口恢复也失败）。"
+                    f"请检查 WORKER_DOMAIN / ADMIN_PASSWORD 配置，或手动补填 tokens.json 中的 email_jwt 字段。"
+                )
 
             email_service = EmailService()
 

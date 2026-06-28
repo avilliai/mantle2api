@@ -35,11 +35,16 @@ class CookieManager:
         try:
             data = json.loads(TOKENS_FILE.read_text(encoding="utf-8"))
             with self._sync_lock:
-                self.accounts = [
-                    AccountState(d, i + 1)
-                    for i, d in enumerate(data)
-                    if d.get("cookie_str")
-                ]
+                accounts = []
+                for i, d in enumerate(data):
+                    if not d.get("cookie_str"):
+                        continue
+                    acc = AccountState(d, i + 1)
+                    # 恢复 email_jwt（保活时收 OTP 必须）
+                    if d.get("email_jwt"):
+                        acc.email_jwt = d["email_jwt"]
+                    accounts.append(acc)
+                self.accounts = accounts
             log.info(f"✅ 成功加载账号: {len(self.accounts)} 个")
         except Exception as e:
             log.error(f"解析 tokens 失败: {e}")
@@ -47,7 +52,14 @@ class CookieManager:
     def save(self) -> None:
         with self._sync_lock:
             try:
-                raw = [acc.to_dict() for acc in self.accounts]
+                raw = []
+                for acc in self.accounts:
+                    d = acc.to_dict()
+                    # email_jwt는 to_dict()에 없을 수 있으므로 명시적으로 추가
+                    email_jwt = getattr(acc, "email_jwt", "")
+                    if email_jwt:
+                        d["email_jwt"] = email_jwt
+                    raw.append(d)
                 TOKENS_FILE.write_text(
                     json.dumps(raw, ensure_ascii=False, indent=4), encoding="utf-8"
                 )
@@ -190,7 +202,7 @@ class CookieManager:
         return {"success": success, "failed": failed}
 
     # ── 定时保活（供 main.py 后台任务调用）───────────────
-    KEEPALIVE_CONCURRENCY = int(os.environ.get("KEEPALIVE_CONCURRENCY", "5"))
+    KEEPALIVE_CONCURRENCY = int(os.environ.get("KEEPALIVE_CONCURRENCY", "20"))
 
     async def keepalive_tick(self) -> None:
         """
