@@ -51,24 +51,40 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 
 # ─────────────────────────── 定时保活 ────────────────────
+# 保活间隔：每 2 小时执行一次 session 检查 + 失效账号重新登录
+KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "7200"))
+
+_ka_log = logging.getLogger("cosverse_proxy.keepalive")
+
+
 async def keep_alive_task():
-    """后台定时保活程序：防止 cookie 过期"""
+    """
+    后台定时保活任务。
+    每次触发时：
+      1. 检查所有未禁用账号的 session 是否仍然有效。
+      2. 对失效账号调用 CosverseRefresher 重新走邮箱登录流程，拿新 cookie。
+      3. 检查备用账号数量是否低于阈值，不足时触发注册。
+    """
+    # 启动后先等待一个完整周期，避免刚加载就立刻跑保活
+    _ka_log.info(f"⏳ 保活任务已启动，首次执行将在 {KEEPALIVE_INTERVAL // 60} 分钟后")
+    await asyncio.sleep(KEEPALIVE_INTERVAL)
+
     while True:
         try:
-            # 每隔 2 小时执行一次保活
-            await asyncio.sleep(7200)
-            logging.getLogger("cosverse_proxy.keepalive").info("🔄 开始执行定时保活任务...")
-
-            for acc in cm.accounts:
-                # 仅对健康且额度未满的账号进行保活
-                if not acc.disabled and acc.usage_count < 100:
-                    await cm.check_session(acc)
-                    await asyncio.sleep(3)  # 防止并发过高，错峰请求
-
+            _ka_log.info("🔄 开始执行定时保活...")
+            await cm.keepalive_tick()
+            _ka_log.info(f"✅ 保活完成，下次执行在 {KEEPALIVE_INTERVAL // 60} 分钟后")
         except asyncio.CancelledError:
+            _ka_log.info("保活任务已取消")
             break
         except Exception as e:
-            logging.getLogger("cosverse_proxy.keepalive").error(f"保活任务异常: {e}")
+            _ka_log.error(f"保活任务异常: {e}", exc_info=True)
+        finally:
+            # 无论成功或失败，都等待下一个周期
+            try:
+                await asyncio.sleep(KEEPALIVE_INTERVAL)
+            except asyncio.CancelledError:
+                pass
 
 
 # ─────────────────────────── 生命周期 ────────────────────
@@ -81,12 +97,15 @@ async def lifespan(app: FastAPI):
         f"🚀 代理服务启动，已加载 {len(cm.accounts)} 个账号"
     )
 
-    # 启动后台保活任务
     bg_task = asyncio.create_task(keep_alive_task())
 
     yield
 
     bg_task.cancel()
+    try:
+        await bg_task
+    except asyncio.CancelledError:
+        pass
 
 
 # ─────────────────────────── App ─────────────────────────
@@ -120,6 +139,7 @@ async def serve_dashboard():
         "<li>GET /v1/models</li>"
         "<li>GET /admin/tokens/detail</li>"
         "<li>POST /admin/register/start</li>"
+        "<li>POST /admin/refresh/all  — 手动触发全量保活</li>"
         "</ul>"
     )
 

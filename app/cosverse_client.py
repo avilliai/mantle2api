@@ -107,22 +107,17 @@ async def upload_file_to_cosverse(
         content_type, _ = mimetypes.guess_type(filename)
         content_type = content_type or "application/octet-stream"
 
-    # 如果外部未提供 chat_id，则自动补充一个，防止服务器因缺失 chatId 校验而返回 400
     if not chat_id:
         chat_id = _random_conv_id()
 
-    # 使用 curl_cffi 的 CurlMime 对象构建表单
     mp = CurlMime()
     try:
-        # 1. 添加文件部分 (data 需为 bytes)
         mp.addpart(
             name="file",
             filename=filename,
             data=data,
             content_type=content_type,
         )
-
-        # 2. 添加 chatId 部分 (显式转换为 bytes 形式，并指定类型为 text/plain)
         mp.addpart(
             name="chatId",
             data=chat_id.encode("utf-8") if isinstance(chat_id, str) else chat_id,
@@ -137,8 +132,6 @@ async def upload_file_to_cosverse(
             "sec-fetch-site": "same-origin",
             "referer": f"{COSVERSE_WEB}/",
         }
-
-        # 关键避坑点：清除可能冲突的 content-type，保证 curl 自动生成的 boundary 正常生效
         headers.pop("content-type", None)
         headers.pop("Content-Type", None)
 
@@ -150,24 +143,19 @@ async def upload_file_to_cosverse(
                 cookies=acc.cookies_dict(),
                 timeout=60,
             )
-
             if resp.status_code in (200, 201):
                 result = resp.json()
                 b64_str = base64.b64encode(data).decode('utf-8')
                 result["dataUri"] = f"data:{content_type};base64,{b64_str}"
-
                 log.info(f"[{acc.email}] 文件上传成功: {result.get('publicUrl', '')}")
-                return result  # {"key": ..., "publicUrl": ..., "dataUri": ...}
+                return result
             else:
-                log.warning(
-                    f"[{acc.email}] 文件上传失败: HTTP {resp.status_code} - {resp.text[:200]}"
-                )
+                log.warning(f"[{acc.email}] 文件上传失败: HTTP {resp.status_code} - {resp.text[:200]}")
                 return None
     except Exception as e:
         log.error(f"[{acc.email}] 文件上传异常: {e}")
         return None
     finally:
-        # 手动释放内存，避免频繁上传带来的开销
         mp.close()
 
 
@@ -179,7 +167,6 @@ async def upload_url_to_cosverse(
     """
     从 URL 下载图片/文件后上传到 Cosverse R2。
     支持 data URI（base64）和 http/https URL。
-    chat_id 必须与后续 stream_cosverse_response 使用的 conv_id 一致。
     """
     import re as _re
 
@@ -212,28 +199,13 @@ async def upload_url_to_cosverse(
         return None
 
 
-# ── 注册客户端 ────────────────────────────────────────────
+# ── 登录公共 Mixin ────────────────────────────────────────
 
-class CosverseRegister:
+class _LoginMixin:
     """
-    注册流程（完全对齐浏览器抓包）：
-    Step 1  POST /auth/signin  email_action   body=["email"]
-    Step 2  POST /auth/signin  otp_action     body=["email", OTP]
-    Step 3  POST /auth/signin  name_action    body=["email", "username"]
-    Step 4  GET  /api/auth/csrf
-    Step 5  POST /api/auth/callback/credentials
-    Step 6  GET  /api/auth/session  → user.id
+    封装 email_action / otp_action / nextauth 三步登录的公共实现，
+    供 CosverseRegister 和 CosverseRefresher 共同继承，避免重复代码。
     """
-
-    def __init__(self):
-        self.email_service  = EmailService()
-        self.email:    str  = ""
-        self.name:     str  = _random_name()
-        self.otp:      str  = ""
-        self._cookies: dict = {}
-        self.user_id:  str  = ""
-        self._jwt:     str  = ""
-        self._cfg           = None
 
     def _absorb(self, resp_cookies) -> None:
         self._cookies = _merge_cookies(self._cookies, dict(resp_cookies))
@@ -249,31 +221,27 @@ class CosverseRegister:
         self._absorb(resp.cookies)
         return resp.status_code, resp.text
 
-    async def step1_send_email(self, session: AsyncSession) -> bool:
+    async def _step_send_email(self, session: AsyncSession, email: str) -> bool:
         status, text = await self._post_action(
-            session, self._cfg.email_action, json.dumps([self.email])
+            session, self._cfg.email_action, json.dumps([email])
         )
-        log.info(f"[{self.email}] Step1 status={status} resp={text[:200]}")
+        log.info(f"[{email}] send_email status={status} resp={text[:200]}")
         data = _parse_action_response(text)
         return bool(data and data.get("success"))
 
-    async def step2_verify_otp(self, session: AsyncSession) -> bool:
+    async def _step_verify_otp(self, session: AsyncSession, email: str, otp: str) -> bool:
         status, text = await self._post_action(
-            session, self._cfg.otp_action, json.dumps([self.email, self.otp])
+            session, self._cfg.otp_action, json.dumps([email, otp])
         )
-        log.info(f"[{self.email}] Step2 OTP={self.otp} status={status} resp={text[:300]}")
+        log.info(f"[{email}] verify_otp OTP={otp} status={status} resp={text[:300]}")
         data = _parse_action_response(text)
         return bool(data and data.get("success"))
 
-    async def step3_set_name(self, session: AsyncSession) -> bool:
-        status, text = await self._post_action(
-            session, self._cfg.name_action, json.dumps([self.email, self.name])
-        )
-        log.info(f"[{self.email}] Step3 name={self.name} status={status} resp={text[:200]}")
-        data = _parse_action_response(text)
-        return bool(data and data.get("success"))
-
-    async def step4_nextauth_login(self, session: AsyncSession) -> bool:
+    async def _step_nextauth_login(self, session: AsyncSession, email: str, otp: str) -> str:
+        """
+        走 csrf → callback/credentials → session 流程。
+        成功返回 user_id 字符串，失败返回空字符串。
+        """
         from urllib.parse import quote
 
         _h_common = {
@@ -284,6 +252,7 @@ class CosverseRegister:
             "referer": f"{COSVERSE_WEB}/auth/signin",
         }
 
+        # 4a. 获取 CSRF token
         csrf_resp = await session.get(
             f"{COSVERSE_API}/auth/csrf",
             headers={**_h_common, "accept": "*/*", "content-type": "application/json"},
@@ -292,10 +261,11 @@ class CosverseRegister:
         )
         self._absorb(csrf_resp.cookies)
         csrf_token = csrf_resp.json().get("csrfToken", "")
-        log.info(f"[{self.email}] Step4a csrfToken={'✓' if csrf_token else '✗'}")
+        log.info(f"[{email}] csrfToken={'✓' if csrf_token else '✗'}")
 
+        # 4b. callback/credentials
         cb_body = (
-            f"email={quote(self.email)}&otp={self.otp}"
+            f"email={quote(email)}&otp={otp}"
             f"&csrfToken={csrf_token}"
             f"&callbackUrl={quote(COSVERSE_WEB + '/auth/signin')}"
         )
@@ -309,8 +279,9 @@ class CosverseRegister:
             timeout=15,
         )
         self._absorb(cb_resp.cookies)
-        log.info(f"[{self.email}] Step4b callback status={cb_resp.status_code}")
+        log.info(f"[{email}] callback status={cb_resp.status_code}")
 
+        # 4c. 验证 session
         sess_resp = await session.get(
             f"{COSVERSE_API}/auth/session",
             headers={**_h_common, "accept": "*/*", "content-type": "application/json"},
@@ -318,22 +289,53 @@ class CosverseRegister:
             timeout=15,
         )
         self._absorb(sess_resp.cookies)
-        self.user_id = sess_resp.json().get("user", {}).get("id", "")
-        log.info(f"[{self.email}] Step4c user_id={self.user_id}")
-        return bool(self.user_id)
+        user_id = sess_resp.json().get("user", {}).get("id", "")
+        log.info(f"[{email}] session user_id={user_id}")
+        return user_id
 
-    async def _wait_for_otp(self, timeout: int = 120) -> str:
+    async def _wait_for_otp(self, email_service: EmailService, jwt: str,
+                             email: str, timeout: int = 120) -> str:
         import asyncio
         for i in range(timeout // 6):
-            raw = self.email_service.fetch_first_email(self._jwt)
+            raw = email_service.fetch_first_email(jwt)
             if raw:
                 otp = _extract_otp_from_email(raw)
                 if otp:
-                    log.info(f"[{self.email}] 第 {i+1} 次检查到 OTP: {otp}")
+                    log.info(f"[{email}] 第 {i+1} 次检查到 OTP: {otp}")
                     return otp
-            log.info(f"[{self.email}] 第 {i+1} 次检查邮件...")
+            log.info(f"[{email}] 第 {i+1} 次检查邮件...")
             await asyncio.sleep(6)
         return ""
+
+
+# ── 注册客户端 ────────────────────────────────────────────
+
+class CosverseRegister(_LoginMixin):
+    """
+    注册流程：
+    Step 1  发送邮箱（触发 OTP）
+    Step 2  验证 OTP
+    Step 3  设置用户名（仅注册需要）
+    Step 4  nextauth 登录拿 session cookie
+    """
+
+    def __init__(self):
+        self.email_service  = EmailService()
+        self.email:    str  = ""
+        self.name:     str  = _random_name()
+        self.otp:      str  = ""
+        self._cookies: dict = {}
+        self.user_id:  str  = ""
+        self._jwt:     str  = ""
+        self._cfg           = None
+
+    async def _step_set_name(self, session: AsyncSession) -> bool:
+        status, text = await self._post_action(
+            session, self._cfg.name_action, json.dumps([self.email, self.name])
+        )
+        log.info(f"[{self.email}] Step3 name={self.name} status={status} resp={text[:200]}")
+        data = _parse_action_response(text)
+        return bool(data and data.get("success"))
 
     async def run(self) -> Optional[dict]:
         try:
@@ -344,16 +346,25 @@ class CosverseRegister:
                 raise RuntimeError("邮箱创建失败")
 
             async with AsyncSession(impersonate=IMPERSONATE, timeout=60) as session:
-                if not await self.step1_send_email(session):
+                if not await self._step_send_email(session, self.email):
                     raise RuntimeError("Step1 发送邮箱失败")
-                self.otp = await self._wait_for_otp()
+
+                self.otp = await self._wait_for_otp(
+                    self.email_service, self._jwt, self.email
+                )
                 if not self.otp:
                     raise RuntimeError("获取 OTP 超时")
-                if not await self.step2_verify_otp(session):
+
+                if not await self._step_verify_otp(session, self.email, self.otp):
                     raise RuntimeError("Step2 OTP 验证失败")
-                if not await self.step3_set_name(session):
+
+                if not await self._step_set_name(session):
                     raise RuntimeError("Step3 设置用户名失败")
-                if not await self.step4_nextauth_login(session):
+
+                self.user_id = await self._step_nextauth_login(
+                    session, self.email, self.otp
+                )
+                if not self.user_id:
                     raise RuntimeError("Step4 next-auth 登录失败")
 
             account = {
@@ -361,6 +372,7 @@ class CosverseRegister:
                 "name":        self.name,
                 "cookie_str":  _cookies_dict_to_str(self._cookies),
                 "user_id":     self.user_id,
+                "email_jwt":   self._jwt,       # 保存邮箱 JWT，供保活使用
                 "healthy":     True,
                 "disabled":    False,
                 "usage_count": 0,
@@ -372,6 +384,98 @@ class CosverseRegister:
             log.error(f"CosverseRegister.run() 失败: {e}")
             import traceback; traceback.print_exc()
             return None
+
+
+# ── 保活客户端 ────────────────────────────────────────────
+
+class CosverseRefresher(_LoginMixin):
+    """
+    保活流程（已有邮箱重新登录，跳过设置用户名）：
+    Step 1  发送邮箱（触发 OTP）
+    Step 2  等待并获取 OTP
+    Step 3  验证 OTP
+    Step 4  nextauth 登录拿新 session cookie
+    成功后直接将新 cookie 写回 AccountState 并标记为健康。
+    """
+
+    def __init__(self, acc: AccountState):
+        self.acc            = acc
+        self.email          = acc.email
+        self.otp:     str   = ""
+        self._cookies: dict = {}
+        self._cfg           = None
+        # 优先从 AccountState 取已保存的邮箱 JWT
+        self._email_jwt: str = getattr(acc, "email_jwt", "")
+
+    async def _recover_email_jwt(self) -> str:
+        """
+        当 AccountState 里没有保存 email_jwt 时，
+        通过管理员接口按邮箱名查 address_id，再调 show_password 取回 JWT。
+        """
+        try:
+            from app.email_service import EmailService as ES
+            es = ES()
+            name = self.email.split("@")[0]
+            jwt, _ = es.recover_email_jwt(name)
+            if jwt:
+                log.info(f"[{self.email}] 成功取回 email_jwt")
+                # 写回 AccountState 避免下次重复查询
+                self.acc.email_jwt = jwt
+            return jwt or ""
+        except Exception as e:
+            log.warning(f"[{self.email}] 取回 email_jwt 失败: {e}")
+            return ""
+
+    async def run(self) -> bool:
+        """
+        执行保活。成功后更新 acc.cookie_str / acc.healthy / acc.disabled。
+        :return: True=成功，False=失败
+        """
+        try:
+            self._cfg = await fetch_action_config()
+
+            # 确保有邮箱 JWT 才能收 OTP
+            if not self._email_jwt:
+                self._email_jwt = await self._recover_email_jwt()
+            if not self._email_jwt:
+                raise RuntimeError("无法获取 email_jwt，无法收取 OTP 验证码")
+
+            email_service = EmailService()
+
+            async with AsyncSession(impersonate=IMPERSONATE, timeout=60) as session:
+                # Step 1：触发 OTP 邮件
+                if not await self._step_send_email(session, self.email):
+                    raise RuntimeError("Step1 发送邮箱失败")
+
+                # Step 2：等待并读取 OTP
+                self.otp = await self._wait_for_otp(
+                    email_service, self._email_jwt, self.email
+                )
+                if not self.otp:
+                    raise RuntimeError("获取 OTP 超时")
+
+                # Step 3：验证 OTP
+                if not await self._step_verify_otp(session, self.email, self.otp):
+                    raise RuntimeError("Step2 OTP 验证失败")
+
+                # Step 4：nextauth 登录（注意：保活不走 set_name）
+                user_id = await self._step_nextauth_login(
+                    session, self.email, self.otp
+                )
+                if not user_id:
+                    raise RuntimeError("Step3 next-auth 登录失败，session 未返回 user_id")
+
+            # ✅ 写回 AccountState
+            self.acc.cookie_str = _cookies_dict_to_str(self._cookies)
+            self.acc.healthy    = True
+            self.acc.disabled   = False
+            log.info(f"[{self.email}] ✅ 保活成功，cookie 已更新")
+            return True
+
+        except Exception as e:
+            log.error(f"[{self.email}] ❌ 保活失败: {e}")
+            import traceback; traceback.print_exc()
+            return False
 
 
 # ── 对话客户端 ────────────────────────────────────────────
@@ -428,7 +532,6 @@ def _chat_body(
     if attachments:
         user_msg["experimental_attachments"] = [
             {
-                # 抓包确认：浏览器传完整 base64 data URI
                 "url":         att.get("dataUri", att.get("publicUrl", "")),
                 "filename":    att.get("name", "file"),
                 "contentType": att.get("contentType", "image/png"),
@@ -446,7 +549,7 @@ def _chat_body(
         "guestMessageCount": 1,
         "userSettings":     {"userName": user_name, "occupation": "", "traits": "", "preferences": ""},
         "chatTitle":        chat_title,
-        "attachments":      [],   # 抓包确认：有图时此字段为空数组
+        "attachments":      [],
         "pdfAttachments":   [],
     }
 
@@ -458,10 +561,6 @@ async def _fetch_chat_title(
     conv_id: str,
     cfg,
 ) -> str:
-    """
-    发 chat 前先调 Next.js Server Action 获取 chatTitle（对齐浏览器行为）。
-    失败时静默回退到 "New Chat"，不影响主流程。
-    """
     if not cfg or not getattr(cfg, "title_action", None):
         return "New Chat"
     try:
@@ -494,10 +593,6 @@ async def stream_cosverse_response(
 ) -> AsyncIterator[str]:
     """
     向 Cosverse /api/chat 发送请求并流式返回文本块。
-
-    :param attachments: _build_attachment_list() 返回的列表（r2 上传结果）
-    :param conv_id:     对话 ID。有附件时必须与上传时传入的 chat_id 相同。
-                        不传则自动生成（无附件场景）。
     """
     if conv_id is None:
         conv_id = _random_conv_id()
