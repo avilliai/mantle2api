@@ -222,11 +222,12 @@ class CookieManager:
     async def keepalive_tick(self) -> None:
         """
         每次定时触发时调用：
-        1. 对所有未禁用且未超额的账号无条件并行保活（重新登录拿新 cookie）
-        2. 检查备用账号是否充足
+        1. 对所有未禁用且未超额的账号并行做 LLM 探活（check_session）
+        2. 仅对探活失败的账号执行 refresh（重新登录拿新 cookie）
+        3. 检查备用账号是否充足
 
-        check_session 无法可靠判断存活状态，因此直接全量保活，
-        由 CosverseRefresher 内部决定是否真的需要重新登录。
+        这样可以避免对仍然有效的账号做不必要的重新登录，
+        节省资源并降低触发风控的风险。
         """
         log.info("⏰ keepalive_tick 开始")
 
@@ -242,24 +243,48 @@ class CookieManager:
             log.info("⏰ keepalive_tick 完成")
             return
 
-        log.info(f"⏰ 开始并行保活，目标账号数: {len(candidates)}，并发度: {self.KEEPALIVE_CONCURRENCY}")
+        log.info(f"⏰ 开始并行探活，目标账号数: {len(candidates)}，并发度: {self.KEEPALIVE_CONCURRENCY}")
 
         sem = asyncio.Semaphore(self.KEEPALIVE_CONCURRENCY)
-        counter = {"ok": 0, "fail": 0}
+        probe_counter = {"alive": 0, "dead": 0}
+        dead_accounts: list[AccountState] = []
 
-        async def _bounded_refresh(acc):
+        async def _bounded_probe(acc):
             async with sem:
-                ok = await self.refresh_account(acc)
-                if ok:
-                    counter["ok"] += 1
+                alive = await self.check_session(acc)
+                if alive:
+                    probe_counter["alive"] += 1
                 else:
-                    counter["fail"] += 1
+                    probe_counter["dead"] += 1
+                    dead_accounts.append(acc)
 
-        await asyncio.gather(*[_bounded_refresh(a) for a in candidates])
+        await asyncio.gather(*[_bounded_probe(a) for a in candidates])
 
         log.info(
-            f"⏰ 并行保活完成：成功 {counter['ok']}，失败 {counter['fail']}，共 {len(candidates)} 个"
+            f"⏰ 探活完成：存活 {probe_counter['alive']}，"
+            f"需刷新 {probe_counter['dead']}，共 {len(candidates)} 个"
         )
+
+        # 仅对探活失败的账号执行 refresh
+        if dead_accounts:
+            log.info(f"⏰ 开始对 {len(dead_accounts)} 个失效账号执行 refresh...")
+            refresh_counter = {"ok": 0, "fail": 0}
+
+            async def _bounded_refresh(acc):
+                async with sem:
+                    ok = await self.refresh_account(acc)
+                    if ok:
+                        refresh_counter["ok"] += 1
+                    else:
+                        refresh_counter["fail"] += 1
+
+            await asyncio.gather(*[_bounded_refresh(a) for a in dead_accounts])
+            log.info(
+                f"⏰ refresh 完成：成功 {refresh_counter['ok']}，"
+                f"失败 {refresh_counter['fail']}"
+            )
+        else:
+            log.info("⏰ 所有账号均存活，无需 refresh。")
 
         await self._ensure_spare_accounts()
         log.info("⏰ keepalive_tick 完成")
@@ -374,30 +399,52 @@ class CookieManager:
         self.save()
         log.info(f"📈 [{acc.email}] 已用: {acc.usage_count}/{ACCOUNT_MAX_USAGE}")
 
-    # ── 账号 session 检查 ─────────────────────────────────
+    # ── 账号 session 检查（LLM 探活） ────────────────────
     async def check_session(self, acc: AccountState) -> bool:
+        """
+        通过发起一次轻量 LLM 对话来判断 session 是否仍然有效。
+        - 正常返回非空文本 → 存活，返回 True
+        - 返回空响应（EmptyResponseError）或 401 → 已过期，返回 False
+        - 其他网络异常 → 保守视为存活（True），避免误杀
+        """
+        from app.cosverse_client import stream_cosverse_response, EmptyResponseError
         try:
-            from curl_cffi.requests import AsyncSession
-            from app.config import COSVERSE_API, COMMON_HEADERS
-            async with AsyncSession(impersonate="chrome110", timeout=15) as session:
-                resp = await session.get(
-                    f"{COSVERSE_API}/auth/session",
-                    headers={**COMMON_HEADERS, "accept": "*/*", "content-type": "application/json"},
-                    cookies=acc.cookies_dict(),
-                )
-                data = resp.json()
-                if data.get("user", {}).get("id"):
-                    acc.healthy = True
-                    self.save()
-                    return True
-                acc.healthy = False
-                self.save()
-                return False
-        except Exception as e:
-            log.error(f"[{acc.email}] session check 失败: {e}")
+            chunks = []
+            async for chunk in stream_cosverse_response(
+                text="Hi",
+                acc=acc,
+                model="gemini-2.0-flash",
+                provider="google",
+            ):
+                chunks.append(chunk)
+                # 拿到第一个非空 chunk 即可确认存活，提前退出
+                break
+
+            alive = len(chunks) > 0
+            acc.healthy = alive
+            self.save()
+            if alive:
+                log.info(f"[{acc.email}] LLM 探活：存活 ✅")
+            else:
+                log.warning(f"[{acc.email}] LLM 探活：空响应，视为过期 ❌")
+            return alive
+
+        except EmptyResponseError:
+            log.warning(f"[{acc.email}] LLM 探活：EmptyResponseError，视为过期 ❌")
             acc.healthy = False
             self.save()
             return False
+
+        except PermissionError:
+            log.warning(f"[{acc.email}] LLM 探活：401 cookie 过期 ❌")
+            acc.healthy = False
+            self.save()
+            return False
+
+        except Exception as e:
+            # 网络抖动等瞬时错误，不确定是否过期，保守认为存活
+            log.warning(f"[{acc.email}] LLM 探活：异常（{e}），保守视为存活")
+            return True
 
 
 # 全局单例

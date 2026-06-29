@@ -26,6 +26,10 @@ class EmptyResponseError(RuntimeError):
     """流式响应内容为空（content_tokens=0），视作 cookie 过期或账号异常。"""
     pass
 
+class ServerError(RuntimeError):
+    """Cosverse 服务端应用层错误（如 invalid_grant），无需重试，直接透传给调用方。"""
+    pass
+
 R2_UPLOAD_URL = f"{COSVERSE_WEB}/api/r2-upload"
 
 
@@ -699,6 +703,14 @@ async def stream_cosverse_response(
                 if chunk:
                     yielded_any = True
                     yield chunk
+            elif line.startswith("3:"):
+                # 服务端应用层错误（如 invalid_grant），与 cookie 无关，直接抛出不重试
+                try:
+                    err_msg = json.loads(line[2:])
+                except Exception:
+                    err_msg = line[2:]
+                log.error(f"[{acc.email}] 服务端错误: {err_msg}")
+                raise ServerError(str(err_msg))
             elif line.startswith("e:") or line.startswith("d:"):
                 break
 
@@ -722,6 +734,7 @@ async def stream_with_retry(
       2. refresh 后重试仍失败 → 切换到号池中的下一个账号，再重试一次；
       3. 连换两个账号都失败 → 注册新账号加入号池，用新账号再试；
       4. 新账号仍失败 → 抛出最终异常。
+    注意：ServerError（服务端应用层错误，如 invalid_grant）直接透传，不触发任何重试。
     """
     from app.cookie_manager import cm
 
@@ -749,6 +762,9 @@ async def stream_with_retry(
         async for chunk in _try_stream(acc):
             yield chunk
         return
+    except ServerError:
+        # 服务端错误与 cookie 无关，直接向上抛出，不重试
+        raise
     except _TRANSIENT_ERRORS as e:
         log.warning(f"首次请求失败（{type(e).__name__}）: {e}")
 
@@ -757,6 +773,8 @@ async def stream_with_retry(
         async for chunk in _refresh_and_retry(acc):
             yield chunk
         return
+    except ServerError:
+        raise
     except Exception as e:
         log.warning(f"refresh 后重试仍失败: {e}")
 
@@ -766,6 +784,8 @@ async def stream_with_retry(
         async for chunk in _try_stream(acc2):
             yield chunk
         return
+    except ServerError:
+        raise
     except _TRANSIENT_ERRORS as e:
         log.warning(f"备用账号（{acc2.email}）也失败: {e}")
     except Exception as e:
