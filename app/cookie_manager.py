@@ -22,8 +22,9 @@ class CookieManager:
     def __init__(self):
         self.accounts: list[AccountState] = []
         self._idx: int = 0
-        self._async_lock = asyncio.Lock()
-        self._sync_lock = threading.Lock()
+        self._async_lock = asyncio.Lock()   # 仅保护换号/注册等写操作
+        self._idx_lock   = asyncio.Lock()   # 仅保护 _idx 轮询，极短临界区
+        self._sync_lock  = threading.Lock()
         self._registering = False
 
     # ── 持久化 ────────────────────────────────────────────
@@ -226,11 +227,11 @@ class CookieManager:
         2. 仅对探活失败的账号执行 refresh（重新登录拿新 cookie）
         3. 检查备用账号是否充足
 
-        这样可以避免对仍然有效的账号做不必要的重新登录，
-        节省资源并降低触发风控的风险。
+        全程不持有 _async_lock / _idx_lock，保活期间 chat 请求完全不受阻塞。
         """
         log.info("⏰ keepalive_tick 开始")
 
+        # 快照候选列表（只读 _sync_lock，极短）
         with self._sync_lock:
             candidates = [
                 a for a in self.accounts
@@ -251,7 +252,8 @@ class CookieManager:
 
         async def _bounded_probe(acc):
             async with sem:
-                alive = await self.check_session(acc)
+                # save=False：只更新内存中的 acc.healthy，全部探完后统一写盘
+                alive = await self.check_session(acc, save=False)
                 if alive:
                     probe_counter["alive"] += 1
                 else:
@@ -260,12 +262,15 @@ class CookieManager:
 
         await asyncio.gather(*[_bounded_probe(a) for a in candidates])
 
+        # 探活结果统一写盘一次，而非每个账号各写一次
+        await self.async_save()
+
         log.info(
             f"⏰ 探活完成：存活 {probe_counter['alive']}，"
             f"需刷新 {probe_counter['dead']}，共 {len(candidates)} 个"
         )
 
-        # 仅对探活失败的账号执行 refresh
+        # 仅对探活失败的账号执行 refresh（refresh 内部自己会 save）
         if dead_accounts:
             log.info(f"⏰ 开始对 {len(dead_accounts)} 个失效账号执行 refresh...")
             refresh_counter = {"ok": 0, "fail": 0}
@@ -291,23 +296,24 @@ class CookieManager:
 
     # ── 轮询获取可用账号 ──────────────────────────────────
     async def get_next(self) -> AccountState:
-        async with self._async_lock:
-            # 顺便对所有账号做一次 24h 重置检查，解禁已满额但已过期的账号
-            for a in self.accounts:
-                self._maybe_reset_usage(a)
+        # 24h 配额重置检查（无锁，属性赋值原子性由 GIL 保证）
+        for a in self.accounts:
+            self._maybe_reset_usage(a)
 
-            valid = [
-                a for a in self.accounts
-                if a.healthy and not a.disabled and a.usage_count < ACCOUNT_MAX_USAGE
-            ]
-            if not valid:
-                log.warning("⚠️ 无可用账号，同步等待注册一个...")
-                acc = await self._register_new_account()
-                if acc:
-                    asyncio.create_task(self._ensure_spare_accounts())
-                    return acc
-                raise HTTPException(500, "无可用账号且自动注册失败")
+        valid = [
+            a for a in self.accounts
+            if a.healthy and not a.disabled and a.usage_count < ACCOUNT_MAX_USAGE
+        ]
+        if not valid:
+            log.warning("⚠️ 无可用账号，同步等待注册一个...")
+            acc = await self._register_new_account()
+            if acc:
+                asyncio.create_task(self._ensure_spare_accounts())
+                return acc
+            raise HTTPException(500, "无可用账号且自动注册失败")
 
+        # 只在轮询取号这一瞬间持锁，不阻塞保活
+        async with self._idx_lock:
             acc = valid[self._idx % len(valid)]
             self._idx += 1
 
@@ -400,12 +406,13 @@ class CookieManager:
         log.info(f"📈 [{acc.email}] 已用: {acc.usage_count}/{ACCOUNT_MAX_USAGE}")
 
     # ── 账号 session 检查（LLM 探活） ────────────────────
-    async def check_session(self, acc: AccountState) -> bool:
+    async def check_session(self, acc: AccountState, save: bool = True) -> bool:
         """
         通过发起一次轻量 LLM 对话来判断 session 是否仍然有效。
         - 正常返回非空文本 → 存活，返回 True
         - 返回空响应（EmptyResponseError）或 401 → 已过期，返回 False
         - 其他网络异常 → 保守视为存活（True），避免误杀
+        save=False 时跳过持久化，供 keepalive_tick 批量探活后统一保存。
         """
         from app.cosverse_client import stream_cosverse_response, EmptyResponseError
         try:
@@ -422,7 +429,8 @@ class CookieManager:
 
             alive = len(chunks) > 0
             acc.healthy = alive
-            self.save()
+            if save:
+                self.save()
             if alive:
                 log.info(f"[{acc.email}] LLM 探活：存活 ✅")
             else:
@@ -432,13 +440,15 @@ class CookieManager:
         except EmptyResponseError:
             log.warning(f"[{acc.email}] LLM 探活：EmptyResponseError，视为过期 ❌")
             acc.healthy = False
-            self.save()
+            if save:
+                self.save()
             return False
 
         except PermissionError:
             log.warning(f"[{acc.email}] LLM 探活：401 cookie 过期 ❌")
             acc.healthy = False
-            self.save()
+            if save:
+                self.save()
             return False
 
         except Exception as e:

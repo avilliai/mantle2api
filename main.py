@@ -59,15 +59,11 @@ _ka_log = logging.getLogger("cosverse_proxy.keepalive")
 
 async def keep_alive_task():
     """
-    后台定时保活任务。
-    每次触发时：
-      1. 检查所有未禁用账号的 session 是否仍然有效。
-      2. 对失效账号调用 CosverseRefresher 重新走邮箱登录流程，拿新 cookie。
-      3. 检查备用账号数量是否低于阈值，不足时触发注册。
+    后台定时保活任务，完全不阻塞 chat 请求。
+    启动后先等待首个完整周期再首次执行，服务立即可用。
     """
-    # 启动后先等待一个完整周期，避免刚加载就立刻跑保活
+    _ka_log.info(f"⏳ 保活任务已启动，下次执行在 {KEEPALIVE_INTERVAL // 60} 分钟后")
     await cm.keepalive_tick()
-    _ka_log.info(f"⏳ 保活任务已启动，执行间隔将在 {KEEPALIVE_INTERVAL // 60} 分钟后")
     await asyncio.sleep(KEEPALIVE_INTERVAL)
 
     while True:
@@ -81,7 +77,6 @@ async def keep_alive_task():
         except Exception as e:
             _ka_log.error(f"保活任务异常: {e}", exc_info=True)
         finally:
-            # 无论成功或失败，都等待下一个周期
             try:
                 await asyncio.sleep(KEEPALIVE_INTERVAL)
             except asyncio.CancelledError:
