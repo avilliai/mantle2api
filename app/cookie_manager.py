@@ -413,7 +413,7 @@ class CookieManager:
             async for chunk in stream_cosverse_response(
                 text="Hi",
                 acc=acc,
-                model="gemini-2.0-flash",
+                model="google/gemma-4-31b-it:free",
                 provider="google",
             ):
                 chunks.append(chunk)
