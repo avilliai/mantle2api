@@ -452,7 +452,9 @@ class CookieManager:
             return False
 
         except Exception as e:
+            log.warning(f"[{acc.email}] LLM 探活 code 429 ❌")
             if "429" in str(e):
+                acc.healthy = False
                 return False
             # 网络抖动等瞬时错误，不确定是否过期，保守认为存活
             log.warning(f"[{acc.email}] LLM 探活：异常（{e}），保守视为存活")
