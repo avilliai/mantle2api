@@ -452,6 +452,8 @@ class CookieManager:
             return False
 
         except Exception as e:
+            if "429" in str(e):
+                return False
             # 网络抖动等瞬时错误，不确定是否过期，保守认为存活
             log.warning(f"[{acc.email}] LLM 探活：异常（{e}），保守视为存活")
             return True
