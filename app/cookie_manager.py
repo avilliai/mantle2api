@@ -14,22 +14,32 @@ from app.models import AccountState
 
 log = logging.getLogger("cosverse_proxy.cookie_manager")
 
+PRE_REGISTER_THRESHOLD = 2
 ACCOUNT_MAX_USAGE = 100
-INITIAL_POOL_SIZE = 10
-REPLENISH_SIZE = 3
-LOW_WATERMARK = 1
+
+# ── 动态账号池配置 ──────────────────────────────────────────
+# 不再对全量账号做批量保活（高频探活会触发验证码风控）。
+# 改为只维护一个小的"活跃池"，仅对池内账号做探活/保活；
+# 池内账号配额耗尽或连续失败达到阈值时被请出池子，
+# 再从备用账号（健康但不在池内）或新注册账号中补充。
+ACTIVE_POOL_SIZE = int(os.environ.get("ACTIVE_POOL_SIZE", "10"))
+REPLENISH_BATCH  = int(os.environ.get("REPLENISH_BATCH", "3"))
+FAIL_THRESHOLD   = int(os.environ.get("ACCOUNT_FAIL_THRESHOLD", "3"))
 
 
 class CookieManager:
     def __init__(self):
         self.accounts: list[AccountState] = []
         self._idx: int = 0
-        self._async_lock = asyncio.Lock()  # 保护写操作
-        self._idx_lock = asyncio.Lock()  # 保护轮询
-        self._sync_lock = threading.Lock()  # 保护本地内存状态
+        self._async_lock = asyncio.Lock()   # 仅保护换号/注册等写操作
+        self._idx_lock   = asyncio.Lock()   # 仅保护 _idx 轮询，极短临界区
+        self._sync_lock  = threading.Lock()
+        self._registering = False
 
-        self.initial_done = False
-        self._maintain_lock = asyncio.Lock()  # 保护账号池水位维护
+        # ── 动态账号池 ──────────────────────────────────────
+        self.active_pool: list[int] = []          # 活跃账号的 index 列表
+        self._pool_lock = asyncio.Lock()           # 保护活跃池增删
+        self._replenishing = False                 # 防止补号任务并发重入
 
     # ── 持久化 ────────────────────────────────────────────
     def load(self) -> None:
@@ -45,13 +55,46 @@ class CookieManager:
                     if not d.get("cookie_str"):
                         continue
                     acc = AccountState(d, i + 1)
+                    # 恢复 email_jwt（保活时收 OTP 必须）
                     if d.get("email_jwt"):
                         acc.email_jwt = d["email_jwt"]
+                    # 恢复 reset_at（24h 配额重置时间戳）
                     if d.get("reset_at"):
                         acc.reset_at = d["reset_at"]
+                    # 恢复 fail_count（连续失败计数，用于活跃池淘汰判断）
+                    acc.fail_count = d.get("fail_count", 0)
                     accounts.append(acc)
                 self.accounts = accounts
             log.info(f"✅ 成功加载账号: {len(self.accounts)} 个")
+
+            # 恢复活跃池：优先使用持久化的 active_pool 字段；
+            # 若文件中没有（旧版本数据/首次升级），则用启发式规则重建。
+            pool_file = TOKENS_FILE.with_name("active_pool.json")
+            restored_pool: list[int] = []
+            if pool_file.exists():
+                try:
+                    restored_pool = json.loads(pool_file.read_text(encoding="utf-8"))
+                except Exception as e:
+                    log.warning(f"解析 active_pool.json 失败: {e}")
+
+            valid_indices = {a.index for a in self.accounts}
+            self.active_pool = [
+                idx for idx in restored_pool
+                if idx in valid_indices
+                and self._account_is_eligible(self._find_by_index(idx))
+            ]
+
+            if not self.active_pool:
+                # 没有可恢复的活跃池快照。注意：这些备用账号的 cookie 默认视为
+                # 已过期/陈旧（哪怕 healthy 标记为 True，那也只是上次保存时的状态，
+                # 不代表当前真的可用）。load() 是同步方法、且在服务启动阶段被调用，
+                # 不适合在这里同步阻塞地逐个收验证码邮件激活。
+                # 因此这里不直接把账号塞进 active_pool，而是保持空池，
+                # 由 main.py 启动后调用的 _replenish_active_pool() 异步任务
+                # 统一走"先 refresh 激活成功才入池"的流程来填充。
+                log.info("♻️ 未找到可用的活跃池快照，活跃池将在启动后异步激活补充")
+            else:
+                log.info(f"✅ 已恢复活跃池: {len(self.active_pool)} 个账号 {self.active_pool}")
         except Exception as e:
             log.error(f"解析 tokens 失败: {e}")
 
@@ -61,16 +104,30 @@ class CookieManager:
                 raw = []
                 for acc in self.accounts:
                     d = acc.to_dict()
+                    # email_jwt는 to_dict()에 없을 수 있으므로 명시적으로 추가
                     email_jwt = getattr(acc, "email_jwt", "")
                     if email_jwt:
                         d["email_jwt"] = email_jwt
+                    # reset_at：24h 配额重置时间戳
                     reset_at = getattr(acc, "reset_at", 0)
                     if reset_at:
                         d["reset_at"] = reset_at
+                    # fail_count：连续失败次数（用于活跃池淘汰判断）
+                    fail_count = getattr(acc, "fail_count", 0)
+                    if fail_count:
+                        d["fail_count"] = fail_count
                     raw.append(d)
                 TOKENS_FILE.write_text(
                     json.dumps(raw, ensure_ascii=False, indent=4), encoding="utf-8"
                 )
+                # 活跃池快照单独存一份小文件，避免污染 tokens.json 结构
+                try:
+                    pool_file = TOKENS_FILE.with_name("active_pool.json")
+                    pool_file.write_text(
+                        json.dumps(self.active_pool, ensure_ascii=False), encoding="utf-8"
+                    )
+                except Exception as e:
+                    log.warning(f"保存 active_pool 快照失败: {e}")
             except Exception as e:
                 log.warning(f"保存 tokens 失败: {e}")
 
@@ -86,8 +143,10 @@ class CookieManager:
         now = time.time()
 
         with self._sync_lock:
+            pool_set = set(self.active_pool)
             for acc in self.accounts:
-                reset_at = getattr(acc, "reset_at", 0) or 0
+                # 计算剩余量时考虑 24h 重置：若已过 24h，usage 视为 0
+                reset_at  = getattr(acc, "reset_at", 0) or 0
                 effective_usage = acc.usage_count if (now - reset_at < 86400) else 0
                 remaining = max(0, ACCOUNT_MAX_USAGE - effective_usage)
                 total_remaining += remaining
@@ -98,22 +157,27 @@ class CookieManager:
                 next_reset_in = max(0, int(86400 - (now - reset_at))) if reset_at else None
 
                 tokens_list.append({
-                    "index": acc.index,
-                    "email": acc.email,
-                    "token_hint": getattr(acc, "token_hint", acc.email),
-                    "is_alive": acc.healthy,
-                    "disabled": acc.disabled,
-                    "remaining": remaining,
-                    "next_reset_in": next_reset_in,
+                    "index":          acc.index,
+                    "email":          acc.email,
+                    "token_hint":     getattr(acc, "token_hint", acc.email),
+                    "is_alive":       acc.healthy,
+                    "disabled":       acc.disabled,
+                    "remaining":      remaining,
+                    "next_reset_in":  next_reset_in,   # 距下次重置的秒数
+                    "in_active_pool": acc.index in pool_set,
+                    "fail_count":     getattr(acc, "fail_count", 0),
                 })
+            pool_size = len(self.active_pool)
 
         return {
             "tokens": tokens_list,
             "summary": {
-                "total": len(self.accounts),
-                "alive": alive_count,
-                "total_remaining": total_remaining,
-                "last_refresh": None,
+                "total":             len(self.accounts),
+                "alive":             alive_count,
+                "total_remaining":   total_remaining,
+                "active_pool_size":  pool_size,
+                "active_pool_target": ACTIVE_POOL_SIZE,
+                "last_refresh":    None,
             },
         }
 
@@ -122,11 +186,12 @@ class CookieManager:
         with self._sync_lock:
             for acc in self.accounts:
                 if acc.email == data.get("email"):
-                    acc.cookie_str = data.get("cookie_str", acc.cookie_str)
-                    acc.name = data.get("name", acc.name)
-                    acc.user_id = data.get("user_id", acc.user_id)
-                    acc.healthy = True
+                    acc.cookie_str  = data.get("cookie_str", acc.cookie_str)
+                    acc.name        = data.get("name", acc.name)
+                    acc.user_id     = data.get("user_id", acc.user_id)
+                    acc.healthy     = True
                     acc.usage_count = data.get("usage_count", acc.usage_count)
+                    # 更新 email_jwt（如果注册时带回来了）
                     if data.get("email_jwt"):
                         acc.email_jwt = data["email_jwt"]
                     return False
@@ -134,11 +199,104 @@ class CookieManager:
             self.accounts.append(AccountState(data, new_idx))
         return True
 
-    # ── 注册新账号 ────────────────────────────────────────
+    # ── 动态账号池：辅助方法 ──────────────────────────────
+    def _find_by_index(self, idx: int) -> Optional[AccountState]:
+        return next((a for a in self.accounts if a.index == idx), None)
+
+    def _account_is_eligible(self, acc: Optional[AccountState]) -> bool:
+        """账号是否具备进入活跃池的资格：健康、未禁用、未超额、未达连续失败阈值。"""
+        if acc is None:
+            return False
+        if not acc.healthy or acc.disabled:
+            return False
+        if acc.usage_count >= ACCOUNT_MAX_USAGE:
+            return False
+        if getattr(acc, "fail_count", 0) >= FAIL_THRESHOLD:
+            return False
+        return True
+
+    async def _evict_from_pool(self, acc: AccountState, reason: str) -> None:
+        """将账号请出活跃池（配额耗尽或连续失败），并触发补充。"""
+        async with self._pool_lock:
+            if acc.index in self.active_pool:
+                self.active_pool.remove(acc.index)
+                log.info(f"📤 [{acc.email}] 已移出活跃池，原因: {reason}（当前池内 {len(self.active_pool)} 个）")
+                await self.async_save()
+        asyncio.create_task(self._replenish_active_pool())
+
+    async def _replenish_active_pool(self) -> None:
+        """
+        补充活跃池至 ACTIVE_POOL_SIZE：
+        - 备用账号（健康、不在池内、有资格）默认 cookie 已过期/陈旧，
+          不能直接拿来用。必须先逐个 refresh_account（触发邮箱验证码 +
+          重新登录换新 cookie）激活成功后，才允许加入活跃池；
+          refresh 失败的候选直接跳过，继续尝试下一个备用账号。
+        - 备用池数量不够或全部激活失败：批量注册新账号补足缺口
+          （注册流程本身就会拿到全新 cookie，无需额外 refresh）。
+        防止并发重入：同一时刻只允许一个补充任务运行。
+        """
+        if self._replenishing:
+            return
+        self._replenishing = True
+        try:
+            # 锁内只做"选候选名单"的快照，不在锁内做网络请求（refresh 涉及
+            # 收验证码邮件，耗时较长，长时间持锁会阻塞其他 evict/get_next 调用）
+            async with self._pool_lock:
+                need = ACTIVE_POOL_SIZE - len(self.active_pool)
+                if need <= 0:
+                    return
+                pool_set = set(self.active_pool)
+                candidates = [
+                    a for a in self.accounts
+                    if a.index not in pool_set and self._account_is_eligible(a)
+                ]
+
+            activated: list[AccountState] = []
+            for acc in candidates:
+                if need - len(activated) <= 0:
+                    break
+                log.info(f"🔑 备用账号 cookie 默认已过期，激活前先 refresh: {acc.email}")
+                ok = await self.refresh_account(acc)
+                if ok:
+                    acc.fail_count = 0
+                    activated.append(acc)
+                    log.info(f"✅ 备用账号激活成功，准备加入活跃池: {acc.email}")
+                else:
+                    log.warning(f"⚠️ 备用账号激活失败，跳过: {acc.email}")
+                await asyncio.sleep(1.5)  # 错峰，避免连续激活请求过于密集
+
+            if activated:
+                async with self._pool_lock:
+                    for a in activated:
+                        if a.index not in self.active_pool:
+                            self.active_pool.append(a.index)
+                    await self.async_save()
+                log.info(f"📥 从备用池补充 {len(activated)} 个激活成功的账号进活跃池: {[a.email for a in activated]}")
+
+            need -= len(activated)
+
+            # 备用池不够（或全部激活失败），注册新账号补足缺口（每批最多 REPLENISH_BATCH 个）
+            to_register = min(need, REPLENISH_BATCH) if need > 0 else 0
+            if to_register > 0:
+                log.info(f"🆕 备用池不足/激活失败过多，需注册 {to_register} 个新账号补充活跃池")
+                for _ in range(to_register):
+                    new_acc = await self._register_new_account()
+                    if new_acc:
+                        async with self._pool_lock:
+                            if new_acc.index not in self.active_pool:
+                                self.active_pool.append(new_acc.index)
+                                await self.async_save()
+                        log.info(f"📥 新注册账号已加入活跃池: {new_acc.email}")
+                    else:
+                        log.warning("⚠️ 注册新账号失败，活跃池补充未完全达标")
+        finally:
+            self._replenishing = False
+
+
     async def _register_new_account(self) -> Optional[AccountState]:
         try:
             from app.cosverse_client import CosverseRegister
-            log.info("🔄 开始注册全新账号...")
+            log.info("🔄 开始注册新账号...")
             result = await asyncio.wait_for(CosverseRegister().run(), timeout=180)
             if result:
                 self.add_account(result)
@@ -154,110 +312,192 @@ class CookieManager:
             log.error(f"注册异常: {e}")
         return None
 
-    # ── 单个账号保活（唤醒）───────────────────────────────
+    async def force_register_new_account(self) -> Optional[AccountState]:
+        return await self._register_new_account()
+
+    async def _ensure_spare_accounts(self) -> None:
+        if self._registering:
+            return
+        valid_count = sum(
+            1 for a in self.accounts
+            if a.healthy and not a.disabled and a.usage_count < ACCOUNT_MAX_USAGE
+        )
+        if valid_count < PRE_REGISTER_THRESHOLD:
+            self._registering = True
+            asyncio.create_task(self._bg_register())
+
+    async def _bg_register(self) -> None:
+        try:
+            await self._register_new_account()
+        finally:
+            self._registering = False
+
+    # ── 保活：单个账号 ────────────────────────────────────
     async def refresh_account(self, acc: AccountState) -> bool:
+        """
+        对指定账号执行保活（重新登录拿新 cookie）。
+        成功后持久化到磁盘。
+        """
         from app.cosverse_client import CosverseRefresher
-        log.info(f"🔄 开始尝试唤醒(保活): {acc.email}")
+        log.info(f"🔄 开始保活: {acc.email}")
         ok = await CosverseRefresher(acc).run()
         if ok:
             await self.async_save()
-            log.info(f"✅ 唤醒成功并已持久化: {acc.email}")
+            log.info(f"✅ 保活成功并已持久化: {acc.email}")
         else:
-            log.warning(f"❌ 唤醒失败: {acc.email}")
+            log.warning(f"❌ 保活失败: {acc.email}")
         return ok
 
-    # ── 已废弃的批量保活（仅留空实现兼容旧后台路由） ───────
+    # ── 保活：批量刷新所有不健康账号 ─────────────────────
     async def refresh_all_unhealthy(self) -> dict:
-        log.warning("拦截调用: 为防范风控，批量保活机制已被抛弃")
-        return {"success": [], "failed": [], "msg": "Batch refresh abandoned to avoid risk control."}
-
-    # ── 动态监测与补充机制 (核心) ─────────────────────────
-    def _get_valid_accounts(self) -> list[AccountState]:
-        """获取当前配额未满、未被禁用且存活的账号列表"""
-        for a in self.accounts:
-            self._maybe_reset_usage(a)
-        return [
-            a for a in self.accounts
-            if a.healthy and not a.disabled and a.usage_count < ACCOUNT_MAX_USAGE
-        ]
-
-    async def maintain_pool(self) -> None:
         """
-        根据实际用量维护账号池。
-        1. 初始期间维持 INITIAL_POOL_SIZE 个账号；
-        2. 当使用耗尽（降至 LOW_WATERMARK 以下）时，仅引入 REPLENISH_SIZE 个账号。
+        批量保活所有 healthy=False 或 disabled=True 的账号。
+        返回 {"success": [...], "failed": [...]} 统计结果。
         """
-        if self._maintain_lock.locked():
+        with self._sync_lock:
+            targets = [
+                a for a in self.accounts
+                if not a.healthy or a.disabled
+            ]
+
+        log.info(f"🔄 批量保活，目标账号数: {len(targets)}")
+        success, failed = [], []
+
+        for acc in targets:
+            # 临时解禁，让 Refresher 可以正常写回
+            acc.disabled = False
+            ok = await self.refresh_account(acc)
+            (success if ok else failed).append(acc.email)
+            await asyncio.sleep(2)   # 错峰，避免短时间内大量请求
+
+        log.info(f"批量保活完成：成功 {len(success)}，失败 {len(failed)}")
+        return {"success": success, "failed": failed}
+
+    # ── 定时保活（供 main.py 后台任务调用）───────────────
+    # 注意：保活范围已从"全量账号"收窄为"活跃池"，
+    # 且并发度刻意调低、加入错峰间隔，降低触发验证码风控的概率。
+    KEEPALIVE_CONCURRENCY = int(os.environ.get("KEEPALIVE_CONCURRENCY", "3"))
+
+    async def keepalive_tick(self) -> None:
+        """
+        每次定时触发时调用：
+        1. 仅对当前活跃池（默认 10 个）内的账号做轻量 LLM 探活
+        2. 仅对探活失败的账号执行 refresh（重新登录拿新 cookie）
+        3. 探活/刷新仍失败的账号请出活跃池并触发补充
+
+        不再对全量账号做批量探活——高频探活/保活是触发验证码风控的主因。
+        全程不持有 _async_lock / _idx_lock，保活期间 chat 请求完全不受阻塞。
+        """
+        log.info("⏰ keepalive_tick 开始（仅活跃池）")
+
+        with self._sync_lock:
+            pool_set = set(self.active_pool)
+            candidates = [a for a in self.accounts if a.index in pool_set]
+
+        if not candidates:
+            log.info("⏰ 活跃池为空，跳过探活，尝试补充。")
+            await self._replenish_active_pool()
+            log.info("⏰ keepalive_tick 完成")
             return
 
-        async with self._maintain_lock:
-            valid_count = len(self._get_valid_accounts())
+        log.info(f"⏰ 开始对活跃池探活，目标账号数: {len(candidates)}，并发度: {self.KEEPALIVE_CONCURRENCY}")
 
-            if not self.initial_done:
-                if valid_count < INITIAL_POOL_SIZE:
-                    needed = INITIAL_POOL_SIZE - valid_count
-                    log.info(f"🔄 启动初始化：账号池需补充 {needed} 个 (目标维持 {INITIAL_POOL_SIZE} 个)")
-                    await self._replenish(needed)
-                self.initial_done = True
-            else:
-                if valid_count <= LOW_WATERMARK:
-                    log.info(
-                        f"⚠️ 触发监测：当前存活配额耗尽 ({valid_count}/{LOW_WATERMARK})，将按需引入 {REPLENISH_SIZE} 个账号")
-                    await self._replenish(REPLENISH_SIZE)
+        sem = asyncio.Semaphore(self.KEEPALIVE_CONCURRENCY)
+        probe_counter = {"alive": 0, "dead": 0}
+        dead_accounts: list[AccountState] = []
 
-    async def _replenish(self, count: int) -> None:
-        """从历史账号中唤醒或注册指定数量的账号，避免高频并发风控"""
-        attempted_indices = set()
-        for i in range(count):
-            candidate = None
-            with self._sync_lock:
-                for a in self.accounts:
-                    # 寻找休眠账号：未因超额被禁用，但因长期未用或过期导致 healthy=False
-                    if not a.healthy and not a.disabled and a.usage_count < ACCOUNT_MAX_USAGE and a.index not in attempted_indices:
-                        candidate = a
-                        break
+        async def _bounded_probe(acc):
+            async with sem:
+                # save=False：只更新内存中的 acc.healthy，全部探完后统一写盘
+                alive = await self.check_session(acc, save=False)
+                if alive:
+                    probe_counter["alive"] += 1
+                else:
+                    probe_counter["dead"] += 1
+                    dead_accounts.append(acc)
+                # 错峰：每个探活请求之间留一点间隔，降低短时间内集中请求的风控风险
+                await asyncio.sleep(1.5)
 
-            if candidate:
-                attempted_indices.add(candidate.index)
-                candidate.disabled = False  # 防御性解禁
-                ok = await self.refresh_account(candidate)
-                if ok:
-                    if i < count - 1: await asyncio.sleep(5)  # 错峰延迟防风控
-                    continue
-                log.warning(f"账号 {candidate.email} 唤醒失败，将转为注册新账号")
+        await asyncio.gather(*[_bounded_probe(a) for a in candidates])
 
-            # 无休眠账号可用或唤醒失败，注册全新号
-            await self._register_new_account()
+        # 探活结果统一写盘一次，而非每个账号各写一次
+        await self.async_save()
 
-            if i < count - 1:
-                await asyncio.sleep(5)
+        log.info(
+            f"⏰ 活跃池探活完成：存活 {probe_counter['alive']}，"
+            f"需刷新 {probe_counter['dead']}，共 {len(candidates)} 个"
+        )
+
+        # 仅对探活失败的账号执行 refresh（refresh 内部自己会 save）
+        evict_targets: list[AccountState] = []
+        if dead_accounts:
+            log.info(f"⏰ 开始对 {len(dead_accounts)} 个失效账号执行 refresh...")
+            refresh_counter = {"ok": 0, "fail": 0}
+
+            async def _bounded_refresh(acc):
+                async with sem:
+                    ok = await self.refresh_account(acc)
+                    if ok:
+                        refresh_counter["ok"] += 1
+                        # refresh 成功视为恢复，清零连续失败计数
+                        acc.fail_count = 0
+                    else:
+                        refresh_counter["fail"] += 1
+                        evict_targets.append(acc)
+                    await asyncio.sleep(1.5)
+
+            await asyncio.gather(*[_bounded_refresh(a) for a in dead_accounts])
+            log.info(
+                f"⏰ refresh 完成：成功 {refresh_counter['ok']}，"
+                f"失败 {refresh_counter['fail']}"
+            )
+        else:
+            log.info("⏰ 活跃池内账号均存活，无需 refresh。")
+
+        # refresh 仍失败的账号请出活跃池，触发补充
+        for acc in evict_targets:
+            await self._evict_from_pool(acc, reason="keepalive_refresh_failed")
+
+        log.info("⏰ keepalive_tick 完成")
 
     # ── 轮询获取可用账号 ──────────────────────────────────
     async def get_next(self) -> AccountState:
-        valid = self._get_valid_accounts()
+        # 24h 配额重置检查（无锁，属性赋值原子性由 GIL 保证）
+        for a in self.accounts:
+            self._maybe_reset_usage(a)
 
-        # 水位偏低，后台静默补充，避免阻塞当前用户
-        if len(valid) <= LOW_WATERMARK:
-            asyncio.create_task(self.maintain_pool())
+        with self._sync_lock:
+            pool_set = set(self.active_pool)
+            valid = [
+                a for a in self.accounts
+                if a.index in pool_set and self._account_is_eligible(a)
+            ]
 
         if not valid:
-            log.warning("⚠️ 彻底无可用账号，同步等待补充任务完成...")
-            async with self._maintain_lock:
-                valid = self._get_valid_accounts()
-                if not valid:
-                    await self._replenish(REPLENISH_SIZE)
-                    valid = self._get_valid_accounts()
-
+            log.warning("⚠️ 活跃池内无可用账号，尝试同步补充...")
+            await self._replenish_active_pool()
+            with self._sync_lock:
+                pool_set = set(self.active_pool)
+                valid = [
+                    a for a in self.accounts
+                    if a.index in pool_set and self._account_is_eligible(a)
+                ]
             if not valid:
-                raise HTTPException(500, "当前无可用账号且按需自动引入失败")
+                raise HTTPException(500, "无可用账号且活跃池补充失败")
+            return valid[0]
 
+        # 只在轮询取号这一瞬间持锁，不阻塞保活
         async with self._idx_lock:
             acc = valid[self._idx % len(valid)]
             self._idx += 1
 
+        # 池内账号若因 24h 重置等原因数量低于阈值，异步触发补充（不阻塞当前请求）
+        if len(valid) < ACTIVE_POOL_SIZE:
+            asyncio.create_task(self._replenish_active_pool())
+
         return acc
 
-    # ── 换号与失败重试逻辑 ────────────────────────────────
+    # ── 换号重试逻辑 ──────────────────────────────────────
     async def mark_failed_and_get_replacement(
             self,
             acc: AccountState,
@@ -265,52 +505,122 @@ class CookieManager:
             attempt: int = 1,
     ) -> AccountState:
         """
-        遇到对话故障时：
-        - 仅标记 healthy=False，使其变为休眠状态进入唤醒候选。
-        - 若连续失败到达第 3 次，判定为遇到风控墙，主动触发引入3个全新/干净账号。
+        账号调用失败时调用。
+        - 累计该账号的连续失败次数（fail_count）；
+        - 未达 FAIL_THRESHOLD（默认 3）：仍可能只是抖动，先从活跃池找备用号顶上，
+          但不立即把该账号请出活跃池（留待下次探活/请求验证是否恢复）；
+        - 达到 FAIL_THRESHOLD：判定该账号确实故障，请出活跃池并异步触发补充
+          （优先从备用池选健康账号，不够再注册新账号）；同时尝试一次保活作为最后挽救，
+          失败则彻底放弃该账号，改用活跃池中的其他账号或新账号。
         """
         async with self._async_lock:
-            acc.healthy = False
-            log.warning(f"❌ 账号 [{acc.email}] 调用异常 (被封或过期)，暂时隔离，原因: {reason} (第{attempt}次重试)")
+            acc.fail_count = getattr(acc, "fail_count", 0) + 1
+            log.warning(
+                f"❌ 账号 [{acc.email}] 请求失败，原因: {reason} "
+                f"(本次重试第{attempt}次，累计连续失败 {acc.fail_count}/{FAIL_THRESHOLD})"
+            )
+
+            reached_threshold = acc.fail_count >= FAIL_THRESHOLD
+            if reached_threshold:
+                acc.healthy  = False
+                acc.disabled = True
             self.save()
 
-        if attempt < 3:
-            valid = self._get_valid_accounts()
-            valid = [a for a in valid if a.index != acc.index]
+            # 先尝试从活跃池里找一个可用的备用账号顶上，避免等待保活/注册
+            with self._sync_lock:
+                pool_set = set(self.active_pool)
+                valid = [
+                    a for a in self.accounts
+                    if a.index in pool_set
+                    and a.index != acc.index
+                    and self._account_is_eligible(a)
+                ]
             if valid:
-                log.info(f"🔄 切换到存活池备用账号: {valid[0].email}")
+                log.info(f"🔄 切换到活跃池内备用账号: {valid[0].email}")
+                if reached_threshold:
+                    asyncio.create_task(self._evict_from_pool(acc, reason=reason))
                 return valid[0]
-            log.warning("⚠️ 备用池已空，立即触发补充...")
 
-        # 连续失败或池子彻底枯竭，果断引入纯新批次
-        log.warning(f"⚠️ 第 {attempt} 次重试或池子空，主动引入 {REPLENISH_SIZE} 个新批次账号...")
-        async with self._maintain_lock:
-            await self._replenish(REPLENISH_SIZE)
-            valid = self._get_valid_accounts()
+            if not reached_threshold:
+                # 还没到淘汰阈值，但活跃池里暂时没有其他备用号了；
+                # 先尝试对该账号保活，能恢复就继续用它，比直接换号/注册更轻量。
+                log.warning(f"⚠️ 活跃池暂无其他备用号，先尝试保活 [{acc.email}]...")
+                ok = await self.refresh_account(acc)
+                if ok:
+                    acc.fail_count = 0
+                    log.info(f"✅ 保活成功，继续使用 [{acc.email}]")
+                    return acc
+                # 保活失败则视同达到阈值，请出活跃池
+                acc.healthy  = False
+                acc.disabled = True
+                self.save()
 
+        # 走到这里：账号已确认故障（达到阈值或保活失败），请出活跃池并补充
+        await self._evict_from_pool(acc, reason=reason)
+
+        # attempt >= 3：先尝试对该账号保活，保活失败再依赖补充逻辑给出新账号
+        if attempt >= 3:
+            log.warning(f"⚠️ 第 {attempt} 次重试，最后尝试保活 [{acc.email}]...")
+            acc.disabled = False   # 解禁才能保活
+            ok = await self.refresh_account(acc)
+            if ok:
+                acc.fail_count = 0
+                log.info(f"✅ 保活成功，继续使用 [{acc.email}]")
+                async with self._pool_lock:
+                    if acc.index not in self.active_pool:
+                        self.active_pool.append(acc.index)
+                        await self.async_save()
+                return acc
+            log.warning("保活失败，改为从补充结果中取号...")
+
+        # 等待补充任务把活跃池填满，再从中取一个可用账号返回
+        await self._replenish_active_pool()
+        with self._sync_lock:
+            pool_set = set(self.active_pool)
+            valid = [
+                a for a in self.accounts
+                if a.index in pool_set and self._account_is_eligible(a)
+            ]
         if valid:
             return valid[0]
 
-        raise HTTPException(500, "换号重试耗尽：引入新批次后仍无可用")
+        # 兜底：直接注册一个新账号
+        new_acc = await self._register_new_account()
+        if new_acc:
+            async with self._pool_lock:
+                if new_acc.index not in self.active_pool:
+                    self.active_pool.append(new_acc.index)
+                    await self.async_save()
+            return new_acc
 
-    # ── 用量计费与 24h 配额恢复 ───────────────────────────
+        raise HTTPException(500, "换号重试失败：无备用账号且自动注册/保活均未成功")
+
+    # ── 用量记账 ──────────────────────────────────────────
     def _maybe_reset_usage(self, acc: AccountState) -> None:
+        """
+        如果距离上次重置已超过 24h，将 usage_count 归零并重新启用账号。
+        reset_at 字段记录上次重置的 Unix 时间戳（秒），持久化在 tokens.json 中。
+        """
         import time
         now = time.time()
         reset_at = getattr(acc, "reset_at", 0) or 0
-        if now - reset_at >= 86400:
+        if now - reset_at >= 86400:  # 24 小时 = 86400 秒
             if acc.usage_count > 0 or acc.disabled:
                 log.info(
-                    f"[{acc.email}] ♻️ 24h 配额重置, usage_count {acc.usage_count} → 0"
+                    f"[{acc.email}] ♻️  24h 配额重置 "
+                    f"(距上次重置 {int((now - reset_at) / 3600)}h)，"
+                    f"usage_count {acc.usage_count} → 0"
                 )
             acc.usage_count = 0
-            acc.reset_at = now
-            if acc.disabled:
-                # 满 24 小时后，移除禁用标记，使其可被重新唤醒
+            acc.reset_at    = now
+            acc.fail_count  = 0
+            # 仅因额度耗尽而被禁用的账号（healthy=True），重置后自动解禁
+            if acc.disabled and acc.healthy:
                 acc.disabled = False
-                log.info(f"[{acc.email}] ♻️ 额度限制解除，已恢复到休眠池等待使用")
+                log.info(f"[{acc.email}] ♻️  额度已重置，自动解禁")
 
     def record_usage(self, acc: AccountState) -> None:
+        # 先检查是否需要重置 24h 配额
         self._maybe_reset_usage(acc)
 
         if hasattr(acc, "increment_usage"):
@@ -318,12 +628,75 @@ class CookieManager:
         else:
             acc.usage_count += 1
 
-        if acc.usage_count >= ACCOUNT_MAX_USAGE:
+        # 一次成功的请求记账，说明账号当前可用，清零连续失败计数
+        acc.fail_count = 0
+
+        quota_exhausted = acc.usage_count >= ACCOUNT_MAX_USAGE
+        if quota_exhausted:
             acc.disabled = True
-            log.info(f"🚫 [{acc.email}] 当日额度耗尽 {ACCOUNT_MAX_USAGE}，自动禁用等待重置。")
+            log.info(f"🚫 [{acc.email}] 额度已达 {ACCOUNT_MAX_USAGE}，自动禁用。")
 
         self.save()
-        log.info(f"📈 [{acc.email}] 已用配额: {acc.usage_count}/{ACCOUNT_MAX_USAGE}")
+        log.info(f"📈 [{acc.email}] 已用: {acc.usage_count}/{ACCOUNT_MAX_USAGE}")
+
+        # 配额耗尽：请出活跃池，异步补充新账号（不阻塞当前请求的返回）
+        if quota_exhausted:
+            asyncio.create_task(self._evict_from_pool(acc, reason="quota_exhausted"))
+
+    # ── 账号 session 检查（LLM 探活） ────────────────────
+    async def check_session(self, acc: AccountState, save: bool = True) -> bool:
+        """
+        通过发起一次轻量 LLM 对话来判断 session 是否仍然有效。
+        - 正常返回非空文本 → 存活，返回 True
+        - 返回空响应（EmptyResponseError）或 401 → 已过期，返回 False
+        - 其他网络异常 → 保守视为存活（True），避免误杀
+        save=False 时跳过持久化，供 keepalive_tick 批量探活后统一保存。
+        """
+        from app.cosverse_client import stream_cosverse_response, EmptyResponseError
+        try:
+            chunks = []
+            async for chunk in stream_cosverse_response(
+                text="Hi",
+                acc=acc,
+                model="google/gemma-4-31b-it:free",
+                provider="google",
+            ):
+                chunks.append(chunk)
+                # 拿到第一个非空 chunk 即可确认存活，提前退出
+                break
+
+            alive = len(chunks) > 0
+            acc.healthy = alive
+            if save:
+                self.save()
+            if alive:
+                log.info(f"[{acc.email}] LLM 探活：存活 ✅")
+            else:
+                log.warning(f"[{acc.email}] LLM 探活：空响应，视为过期 ❌")
+            return alive
+
+        except EmptyResponseError:
+            log.warning(f"[{acc.email}] LLM 探活：EmptyResponseError，视为过期 ❌")
+            acc.healthy = False
+            if save:
+                self.save()
+            return False
+
+        except PermissionError:
+            log.warning(f"[{acc.email}] LLM 探活：401 cookie 过期 ❌")
+            acc.healthy = False
+            if save:
+                self.save()
+            return False
+
+        except Exception as e:
+            log.warning(f"[{acc.email}] LLM 探活 code 429 ❌")
+            if "429" in str(e):
+                acc.healthy = False
+                return False
+            # 网络抖动等瞬时错误，不确定是否过期，保守认为存活
+            log.warning(f"[{acc.email}] LLM 探活：异常（{e}），保守视为存活")
+            return True
 
 
 # 全局单例

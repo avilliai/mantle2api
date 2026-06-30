@@ -1,5 +1,7 @@
-# app/main.py
-
+"""
+Cosverse.ai → OpenAI-compatible API Proxy
+入口文件
+"""
 import asyncio
 import logging
 import os
@@ -48,30 +50,40 @@ class AuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-# ─────────────────────────── 动态账号池维护任务 ────────────
-# 监控间隔：每分钟扫描一次用量耗尽状况，按需静默激活账号
-POOL_MAINTAIN_INTERVAL = int(os.getenv("POOL_MAINTAIN_INTERVAL", "60"))
+# ─────────────────────────── 定时保活 ────────────────────
+# 注意：keepalive_tick 内部已改为只对"活跃账号池"（默认 10 个，
+# 可用 ACTIVE_POOL_SIZE 环境变量调整）做探活/保活，不再扫描全量账号，
+# 以降低高频探活触发验证码风控的概率。
+# 保活间隔：默认每次执行间隔由 KEEPALIVE_INTERVAL（秒）控制。
+KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "10000"))
 
-_pool_log = logging.getLogger("cosverse_proxy.pool_monitor")
+_ka_log = logging.getLogger("cosverse_proxy.keepalive")
 
 
-async def pool_monitor_task():
+async def keep_alive_task():
     """
-    轻量化的动态后台任务，仅看水位，不执行主动探活。
+    后台定时保活任务，完全不阻塞 chat 请求。
+    启动后先等待首个完整周期再首次执行，服务立即可用。
     """
-    _pool_log.info(f"⏳ 动态水位监测任务已启动，检查间隔: {POOL_MAINTAIN_INTERVAL}s")
-    # 刚启动时立即检查一遍，确保初始目标 10 个号
-    await cm.maintain_pool()
+    _ka_log.info(f"⏳ 保活任务已启动，下次执行在 {KEEPALIVE_INTERVAL // 60} 分钟后")
+    await cm.keepalive_tick()
+    await asyncio.sleep(KEEPALIVE_INTERVAL)
 
     while True:
         try:
-            await asyncio.sleep(POOL_MAINTAIN_INTERVAL)
-            await cm.maintain_pool()
+            _ka_log.info("🔄 开始执行定时保活...")
+            await cm.keepalive_tick()
+            _ka_log.info(f"✅ 保活完成，下次执行在 {KEEPALIVE_INTERVAL // 60} 分钟后")
         except asyncio.CancelledError:
-            _pool_log.info("水位监测任务已取消")
+            _ka_log.info("保活任务已取消")
             break
         except Exception as e:
-            _pool_log.error(f"水位监测任务异常: {e}", exc_info=True)
+            _ka_log.error(f"保活任务异常: {e}", exc_info=True)
+        finally:
+            try:
+                await asyncio.sleep(KEEPALIVE_INTERVAL)
+            except asyncio.CancelledError:
+                pass
 
 
 # ─────────────────────────── 生命周期 ────────────────────
@@ -81,10 +93,18 @@ async def lifespan(app: FastAPI):
     from app.action_fetcher import fetch_action_config
     await fetch_action_config()
     logging.getLogger("cosverse_proxy").info(
-        f"🚀 代理服务启动，已加载本地 {len(cm.accounts)} 个历史账号"
+        f"🚀 代理服务启动，已加载 {len(cm.accounts)} 个账号，"
+        f"活跃池 {len(cm.active_pool)} 个"
     )
 
-    bg_task = asyncio.create_task(pool_monitor_task())
+    # 活跃池不足（含冷启动空池）：立即异步激活补充，不必等首个 keepalive 周期。
+    # 备用账号 cookie 默认视为陈旧，_replenish_active_pool 内部会先逐个
+    # refresh（收验证码邮件激活）成功后才纳入活跃池。
+    from app.cookie_manager import ACTIVE_POOL_SIZE
+    if len(cm.active_pool) < ACTIVE_POOL_SIZE:
+        asyncio.create_task(cm._replenish_active_pool())
+
+    bg_task = asyncio.create_task(keep_alive_task())
 
     yield
 
@@ -126,7 +146,7 @@ async def serve_dashboard():
         "<li>GET /v1/models</li>"
         "<li>GET /admin/tokens/detail</li>"
         "<li>POST /admin/register/start</li>"
-        "<li><del>POST /admin/refresh/all</del> (已废弃：改为按用量动态唤醒防风控)</li>"
+        "<li>POST /admin/refresh/all  — 手动触发全量保活</li>"
         "</ul>"
     )
 
