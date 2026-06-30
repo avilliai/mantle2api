@@ -728,15 +728,13 @@ async def stream_with_retry(
     conv_id: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """
-    带自动重试的流式对话入口。
-    失败策略：
-      1. 当前账号空响应或 cookie 过期 → 对该账号执行 refresh，重试一次；
-      2. refresh 后重试仍失败 → 切换到号池中的下一个账号，再重试一次；
-      3. 连换两个账号都失败 → 注册新账号加入号池，用新账号再试；
-      4. 新账号仍失败 → 抛出最终异常。
-    注意：ServerError（服务端应用层错误，如 invalid_grant）直接透传，不触发任何重试。
+    带自动重试的流式对话入口，符合风控规避策略：
+      1. 首发尝试当前池子内账号；
+      2. 失败后不再盲目死磕刷新该账号，而是立刻切换备用；
+      3. 连续两次换号仍然失败，则判定池内账号质量堪忧，触发管理系统大换血（引入3个全新号），用纯净号完成最后重试。
     """
     from app.cookie_manager import cm
+    from app.cosverse_client import stream_cosverse_response
 
     _TRANSIENT_ERRORS = (PermissionError, EmptyResponseError)
 
@@ -745,15 +743,6 @@ async def stream_with_retry(
         async for chunk in stream_cosverse_response(
             text, acc, model, provider, attachments, conv_id
         ):
-            yield chunk
-
-    async def _refresh_and_retry(acc: AccountState) -> AsyncIterator[str]:
-        """对 acc 执行 refresh，成功则重试流式请求，失败则抛出。"""
-        log.warning(f"[{acc.email}] 触发 refresh 后重试...")
-        ok = await cm.refresh_account(acc)
-        if not ok:
-            raise RuntimeError(f"[{acc.email}] refresh 失败，无法重试")
-        async for chunk in _try_stream(acc):
             yield chunk
 
     # ── 第一次尝试 ──────────────────────────────────────
@@ -767,37 +756,29 @@ async def stream_with_retry(
         raise
     except _TRANSIENT_ERRORS as e:
         log.warning(f"首次请求失败（{type(e).__name__}）: {e}")
-
-    # ── 第二次：对同一账号 refresh 后重试 ───────────────
-    try:
-        async for chunk in _refresh_and_retry(acc):
-            yield chunk
-        return
-    except ServerError:
-        raise
     except Exception as e:
-        log.warning(f"refresh 后重试仍失败: {e}")
+        log.warning(f"首次请求异常: {e}")
 
-    # ── 第三次：换备用账号 ──────────────────────────────
+    # ── 第二次：直接换用池内另一账号 ──────────────────────
     try:
-        acc2 = await cm.mark_failed_and_get_replacement(acc, reason="empty_or_expired", attempt=2)
+        acc2 = await cm.mark_failed_and_get_replacement(acc, reason="failed_1st_attempt", attempt=2)
         async for chunk in _try_stream(acc2):
             yield chunk
         return
     except ServerError:
         raise
     except _TRANSIENT_ERRORS as e:
-        log.warning(f"备用账号（{acc2.email}）也失败: {e}")
+        log.warning(f"换号后第二次请求依然失败: {e}")
     except Exception as e:
-        log.warning(f"切换备用账号异常: {e}")
+        log.warning(f"备用账号异常: {e}")
 
-    # ── 第四次：注册新账号 ──────────────────────────────
-    log.warning("两个账号均失败，尝试注册新账号...")
+    # ── 第三次：连续失败，强制注入新血并做最终重试 ────────
+    log.warning("连续失败！疑似进入风控环境，果断引入 3 个纯净账号重试...")
     try:
-        acc3 = await cm.mark_failed_and_get_replacement(acc, reason="all_failed", attempt=3)
+        acc3 = await cm.mark_failed_and_get_replacement(acc2, reason="continuous_failures", attempt=3)
         async for chunk in _try_stream(acc3):
             yield chunk
         return
     except Exception as e:
-        log.error(f"注册新账号后仍失败: {e}")
-        raise RuntimeError("所有重试策略均已耗尽，对话请求失败") from e
+        log.error(f"最终大换血重试失败: {e}")
+        raise RuntimeError("所有风控规避与重试策略均已耗尽，对话请求失败") from e

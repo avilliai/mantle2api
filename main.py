@@ -1,7 +1,5 @@
-"""
-Cosverse.ai → OpenAI-compatible API Proxy
-入口文件
-"""
+# app/main.py
+
 import asyncio
 import logging
 import os
@@ -50,37 +48,30 @@ class AuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-# ─────────────────────────── 定时保活 ────────────────────
-# 保活间隔：每 2 小时执行一次 session 检查 + 失效账号重新登录
-KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "10000"))
+# ─────────────────────────── 动态账号池维护任务 ────────────
+# 监控间隔：每分钟扫描一次用量耗尽状况，按需静默激活账号
+POOL_MAINTAIN_INTERVAL = int(os.getenv("POOL_MAINTAIN_INTERVAL", "60"))
 
-_ka_log = logging.getLogger("cosverse_proxy.keepalive")
+_pool_log = logging.getLogger("cosverse_proxy.pool_monitor")
 
 
-async def keep_alive_task():
+async def pool_monitor_task():
     """
-    后台定时保活任务，完全不阻塞 chat 请求。
-    启动后先等待首个完整周期再首次执行，服务立即可用。
+    轻量化的动态后台任务，仅看水位，不执行主动探活。
     """
-    _ka_log.info(f"⏳ 保活任务已启动，下次执行在 {KEEPALIVE_INTERVAL // 60} 分钟后")
-    await cm.keepalive_tick()
-    await asyncio.sleep(KEEPALIVE_INTERVAL)
+    _pool_log.info(f"⏳ 动态水位监测任务已启动，检查间隔: {POOL_MAINTAIN_INTERVAL}s")
+    # 刚启动时立即检查一遍，确保初始目标 10 个号
+    await cm.maintain_pool()
 
     while True:
         try:
-            _ka_log.info("🔄 开始执行定时保活...")
-            await cm.keepalive_tick()
-            _ka_log.info(f"✅ 保活完成，下次执行在 {KEEPALIVE_INTERVAL // 60} 分钟后")
+            await asyncio.sleep(POOL_MAINTAIN_INTERVAL)
+            await cm.maintain_pool()
         except asyncio.CancelledError:
-            _ka_log.info("保活任务已取消")
+            _pool_log.info("水位监测任务已取消")
             break
         except Exception as e:
-            _ka_log.error(f"保活任务异常: {e}", exc_info=True)
-        finally:
-            try:
-                await asyncio.sleep(KEEPALIVE_INTERVAL)
-            except asyncio.CancelledError:
-                pass
+            _pool_log.error(f"水位监测任务异常: {e}", exc_info=True)
 
 
 # ─────────────────────────── 生命周期 ────────────────────
@@ -90,10 +81,10 @@ async def lifespan(app: FastAPI):
     from app.action_fetcher import fetch_action_config
     await fetch_action_config()
     logging.getLogger("cosverse_proxy").info(
-        f"🚀 代理服务启动，已加载 {len(cm.accounts)} 个账号"
+        f"🚀 代理服务启动，已加载本地 {len(cm.accounts)} 个历史账号"
     )
 
-    bg_task = asyncio.create_task(keep_alive_task())
+    bg_task = asyncio.create_task(pool_monitor_task())
 
     yield
 
@@ -135,7 +126,7 @@ async def serve_dashboard():
         "<li>GET /v1/models</li>"
         "<li>GET /admin/tokens/detail</li>"
         "<li>POST /admin/register/start</li>"
-        "<li>POST /admin/refresh/all  — 手动触发全量保活</li>"
+        "<li><del>POST /admin/refresh/all</del> (已废弃：改为按用量动态唤醒防风控)</li>"
         "</ul>"
     )
 
