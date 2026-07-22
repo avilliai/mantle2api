@@ -66,7 +66,6 @@ async def keep_alive_task():
     启动后先等待首个完整周期再首次执行，服务立即可用。
     """
     _ka_log.info(f"⏳ 保活任务已启动，下次执行在 {KEEPALIVE_INTERVAL // 60} 分钟后")
-    await cm.keepalive_tick()
     await asyncio.sleep(KEEPALIVE_INTERVAL)
 
     while True:

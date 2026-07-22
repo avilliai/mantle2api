@@ -25,6 +25,14 @@ ACCOUNT_MAX_USAGE = 100
 ACTIVE_POOL_SIZE = int(os.environ.get("ACTIVE_POOL_SIZE", "10"))
 REPLENISH_BATCH  = int(os.environ.get("REPLENISH_BATCH", "3"))
 FAIL_THRESHOLD   = int(os.environ.get("ACCOUNT_FAIL_THRESHOLD", "3"))
+REPLENISH_PROBE_LIMIT = int(os.environ.get("REPLENISH_PROBE_LIMIT", "20"))
+AUTO_OTP_REFRESH = os.environ.get("AUTO_OTP_REFRESH", "false").lower() in ("1", "true", "yes")
+AUTO_OTP_REFRESH_MAX_PER_TICK = int(
+    os.environ.get("AUTO_OTP_REFRESH_MAX_PER_TICK", "1")
+)
+AUTO_REGISTER_ON_REPLENISH = os.environ.get(
+    "AUTO_REGISTER_ON_REPLENISH", "false"
+).lower() in ("1", "true", "yes")
 
 
 class CookieManager:
@@ -227,12 +235,10 @@ class CookieManager:
     async def _replenish_active_pool(self) -> None:
         """
         补充活跃池至 ACTIVE_POOL_SIZE：
-        - 备用账号（健康、不在池内、有资格）默认 cookie 已过期/陈旧，
-          不能直接拿来用。必须先逐个 refresh_account（触发邮箱验证码 +
-          重新登录换新 cookie）激活成功后，才允许加入活跃池；
-          refresh 失败的候选直接跳过，继续尝试下一个备用账号。
-        - 备用池数量不够或全部激活失败：批量注册新账号补足缺口
-          （注册流程本身就会拿到全新 cookie，无需额外 refresh）。
+        - 备用账号先发送 hello 做真实 LLM 探活，成功后直接加入活跃池。
+        - 默认不自动发送 OTP、不自动注册，避免几百账号集中触发邮箱风控。
+        - 如显式开启 AUTO_OTP_REFRESH / AUTO_REGISTER_ON_REPLENISH，
+          仍会受到全局 OTP 限流与熔断保护。
         防止并发重入：同一时刻只允许一个补充任务运行。
         """
         if self._replenishing:
@@ -249,21 +255,30 @@ class CookieManager:
                 candidates = [
                     a for a in self.accounts
                     if a.index not in pool_set and self._account_is_eligible(a)
-                ]
+                ][:max(1, REPLENISH_PROBE_LIMIT)]
 
             activated: list[AccountState] = []
+            otp_refreshes = 0
             for acc in candidates:
                 if need - len(activated) <= 0:
                     break
-                log.info(f"🔑 备用账号 cookie 默认已过期，激活前先 refresh: {acc.email}")
-                ok = await self.refresh_account(acc)
+                log.info(f"👋 备用账号先执行 hello 探活: {acc.email}")
+                ok = await self.check_session(acc, save=False)
+                if (
+                    not ok
+                    and AUTO_OTP_REFRESH
+                    and otp_refreshes < AUTO_OTP_REFRESH_MAX_PER_TICK
+                ):
+                    otp_refreshes += 1
+                    log.warning(f"🔑 hello 探活失败，受控 OTP 刷新: {acc.email}")
+                    ok = await self.refresh_account(acc)
                 if ok:
                     acc.fail_count = 0
                     activated.append(acc)
                     log.info(f"✅ 备用账号激活成功，准备加入活跃池: {acc.email}")
                 else:
                     log.warning(f"⚠️ 备用账号激活失败，跳过: {acc.email}")
-                await asyncio.sleep(1.5)  # 错峰，避免连续激活请求过于密集
+                await asyncio.sleep(0.75)
 
             if activated:
                 async with self._pool_lock:
@@ -276,7 +291,10 @@ class CookieManager:
             need -= len(activated)
 
             # 备用池不够（或全部激活失败），注册新账号补足缺口（每批最多 REPLENISH_BATCH 个）
-            to_register = min(need, REPLENISH_BATCH) if need > 0 else 0
+            to_register = (
+                min(need, REPLENISH_BATCH)
+                if need > 0 and AUTO_REGISTER_ON_REPLENISH else 0
+            )
             if to_register > 0:
                 log.info(f"🆕 备用池不足/激活失败过多，需注册 {to_register} 个新账号补充活跃池")
                 for _ in range(to_register):
@@ -289,6 +307,11 @@ class CookieManager:
                         log.info(f"📥 新注册账号已加入活跃池: {new_acc.email}")
                     else:
                         log.warning("⚠️ 注册新账号失败，活跃池补充未完全达标")
+            elif need > 0:
+                log.warning(
+                    f"活跃池仍缺 {need} 个账号；自动注册已关闭，"
+                    "不会触发额外 OTP 邮件"
+                )
         finally:
             self._replenishing = False
 
@@ -316,6 +339,8 @@ class CookieManager:
         return await self._register_new_account()
 
     async def _ensure_spare_accounts(self) -> None:
+        if not AUTO_REGISTER_ON_REPLENISH:
+            return
         if self._registering:
             return
         valid_count = sum(
@@ -428,29 +453,36 @@ class CookieManager:
             f"需刷新 {probe_counter['dead']}，共 {len(candidates)} 个"
         )
 
-        # 仅对探活失败的账号执行 refresh（refresh 内部自己会 save）
+        # 默认不对探活失败账号自动发 OTP；仅在显式开启时受控刷新。
         evict_targets: list[AccountState] = []
         if dead_accounts:
-            log.info(f"⏰ 开始对 {len(dead_accounts)} 个失效账号执行 refresh...")
-            refresh_counter = {"ok": 0, "fail": 0}
+            if not AUTO_OTP_REFRESH:
+                log.warning(
+                    f"⏰ {len(dead_accounts)} 个账号 hello 探活失败；"
+                    "AUTO_OTP_REFRESH=false，直接移出活跃池"
+                )
+                evict_targets.extend(dead_accounts)
+            else:
+                limited_dead = dead_accounts[:max(0, AUTO_OTP_REFRESH_MAX_PER_TICK)]
+                evict_targets.extend(dead_accounts[len(limited_dead):])
+                log.info(f"⏰ 开始对 {len(limited_dead)} 个失效账号执行受控 refresh...")
+                refresh_counter = {"ok": 0, "fail": 0}
 
-            async def _bounded_refresh(acc):
-                async with sem:
-                    ok = await self.refresh_account(acc)
-                    if ok:
-                        refresh_counter["ok"] += 1
-                        # refresh 成功视为恢复，清零连续失败计数
-                        acc.fail_count = 0
-                    else:
-                        refresh_counter["fail"] += 1
-                        evict_targets.append(acc)
-                    await asyncio.sleep(1.5)
+                async def _bounded_refresh(acc):
+                    async with sem:
+                        ok = await self.refresh_account(acc)
+                        if ok:
+                            refresh_counter["ok"] += 1
+                            acc.fail_count = 0
+                        else:
+                            refresh_counter["fail"] += 1
+                            evict_targets.append(acc)
 
-            await asyncio.gather(*[_bounded_refresh(a) for a in dead_accounts])
-            log.info(
-                f"⏰ refresh 完成：成功 {refresh_counter['ok']}，"
-                f"失败 {refresh_counter['fail']}"
-            )
+                await asyncio.gather(*[_bounded_refresh(a) for a in limited_dead])
+                log.info(
+                    f"⏰ refresh 完成：成功 {refresh_counter['ok']}，"
+                    f"失败 {refresh_counter['fail']}"
+                )
         else:
             log.info("⏰ 活跃池内账号均存活，无需 refresh。")
 
@@ -544,12 +576,13 @@ class CookieManager:
             if not reached_threshold:
                 # 还没到淘汰阈值，但活跃池里暂时没有其他备用号了；
                 # 先尝试对该账号保活，能恢复就继续用它，比直接换号/注册更轻量。
-                log.warning(f"⚠️ 活跃池暂无其他备用号，先尝试保活 [{acc.email}]...")
-                ok = await self.refresh_account(acc)
-                if ok:
-                    acc.fail_count = 0
-                    log.info(f"✅ 保活成功，继续使用 [{acc.email}]")
-                    return acc
+                if AUTO_OTP_REFRESH:
+                    log.warning(f"⚠️ 活跃池暂无其他备用号，受控保活 [{acc.email}]...")
+                    ok = await self.refresh_account(acc)
+                    if ok:
+                        acc.fail_count = 0
+                        log.info(f"✅ 保活成功，继续使用 [{acc.email}]")
+                        return acc
                 # 保活失败则视同达到阈值，请出活跃池
                 acc.healthy  = False
                 acc.disabled = True
@@ -559,7 +592,7 @@ class CookieManager:
         await self._evict_from_pool(acc, reason=reason)
 
         # attempt >= 3：先尝试对该账号保活，保活失败再依赖补充逻辑给出新账号
-        if attempt >= 3:
+        if attempt >= 3 and AUTO_OTP_REFRESH:
             log.warning(f"⚠️ 第 {attempt} 次重试，最后尝试保活 [{acc.email}]...")
             acc.disabled = False   # 解禁才能保活
             ok = await self.refresh_account(acc)
@@ -585,13 +618,14 @@ class CookieManager:
             return valid[0]
 
         # 兜底：直接注册一个新账号
-        new_acc = await self._register_new_account()
-        if new_acc:
-            async with self._pool_lock:
-                if new_acc.index not in self.active_pool:
-                    self.active_pool.append(new_acc.index)
-                    await self.async_save()
-            return new_acc
+        if AUTO_REGISTER_ON_REPLENISH:
+            new_acc = await self._register_new_account()
+            if new_acc:
+                async with self._pool_lock:
+                    if new_acc.index not in self.active_pool:
+                        self.active_pool.append(new_acc.index)
+                        await self.async_save()
+                return new_acc
 
         raise HTTPException(500, "换号重试失败：无备用账号且自动注册/保活均未成功")
 
@@ -653,13 +687,18 @@ class CookieManager:
         save=False 时跳过持久化，供 keepalive_tick 批量探活后统一保存。
         """
         from app.cosverse_client import stream_cosverse_response, EmptyResponseError
+        from app.routers.model_list import resolve_model
         try:
+            probe_text = os.environ.get("KEEPALIVE_MESSAGE", "hello")
+            probe_model = os.environ.get("KEEPALIVE_MODEL", "gemini-3-flash-preview")
+            model_id, provider = resolve_model(probe_model)
             chunks = []
             async for chunk in stream_cosverse_response(
-                text="Hi",
+                text=probe_text,
                 acc=acc,
-                model="google/gemma-4-31b-it:free",
-                provider="google",
+                model=model_id,
+                provider=provider,
+                generate_title=False,
             ):
                 chunks.append(chunk)
                 # 拿到第一个非空 chunk 即可确认存活，提前退出
@@ -690,11 +729,7 @@ class CookieManager:
             return False
 
         except Exception as e:
-            log.warning(f"[{acc.email}] LLM 探活 code 429 ❌")
-            if "429" in str(e):
-                acc.healthy = False
-                return False
-            # 网络抖动等瞬时错误，不确定是否过期，保守认为存活
+            # 429、模型错误和网络抖动都不能证明 token 失效，避免误触发 OTP。
             log.warning(f"[{acc.email}] LLM 探活：异常（{e}），保守视为存活")
             return True
 

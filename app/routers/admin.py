@@ -2,7 +2,9 @@
 管理接口路由
 """
 import concurrent.futures
+import asyncio
 import logging
+import os
 import time
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
@@ -12,7 +14,15 @@ from app.cookie_manager import cm
 log    = logging.getLogger("cosverse_proxy.admin")
 router = APIRouter(prefix="/admin")
 
-register_executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+REGISTER_CONCURRENCY_LIMIT = max(
+    1, int(os.getenv("REGISTER_CONCURRENCY_LIMIT", "2"))
+)
+ADMIN_PROBE_CONCURRENCY = max(
+    1, int(os.getenv("ADMIN_PROBE_CONCURRENCY", "2"))
+)
+register_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=REGISTER_CONCURRENCY_LIMIT
+)
 
 
 def _register_worker(task_id: int) -> None:
@@ -54,12 +64,8 @@ async def get_all_tokens_detail():
 
 @router.post("/tokens/refresh")
 async def tokens_refresh_all(background_tasks: BackgroundTasks):
-    async def _task():
-        for acc in cm.accounts:
-            if not acc.disabled:
-                await cm.check_session(acc)
-    background_tasks.add_task(_task)
-    return {"message": "后台刷新已启动"}
+    background_tasks.add_task(cm.keepalive_tick)
+    return {"message": "活跃池 hello 探活已启动，不会扫描全量账号或自动发送 OTP"}
 
 
 @router.post("/tokens/{idx}/refresh")
@@ -67,8 +73,35 @@ async def token_refresh_one(idx: int):
     acc = next((a for a in cm.accounts if a.index == idx), None)
     if not acc:
         raise HTTPException(404, "账号不存在")
-    await cm.check_session(acc)
-    return {"message": "刷新成功", "token": _account_view(acc)}
+    alive = await cm.check_session(acc)
+    return {
+        "message": "hello 探活完成",
+        "alive": alive,
+        "token": _account_view(acc),
+    }
+
+
+@router.post("/tokens/bulk/refresh")
+async def tokens_bulk_refresh(req: Request, background_tasks: BackgroundTasks):
+    indexes: list[int] = (await req.json()).get("indexes", [])
+    selected = [a for a in cm.accounts if a.index in indexes and not a.disabled]
+
+    async def _task():
+        sem = asyncio.Semaphore(ADMIN_PROBE_CONCURRENCY)
+
+        async def _probe(acc):
+            async with sem:
+                await cm.check_session(acc, save=False)
+                await asyncio.sleep(1)
+
+        await asyncio.gather(*[_probe(acc) for acc in selected])
+        await cm.async_save()
+
+    background_tasks.add_task(_task)
+    return {
+        "message": f"已启动 {len(selected)} 个账号的 hello 探活",
+        "count": len(selected),
+    }
 
 
 @router.post("/tokens/bulk/disable")
@@ -127,12 +160,18 @@ async def register_start(req: Request):
     global register_executor
     data  = await req.json()
     count = int(data.get("count", 1))
-    conc  = int(data.get("concurrency", 2))
-    if register_executor._max_workers < conc:
+    requested_conc = int(data.get("concurrency", 1))
+    conc = max(1, min(requested_conc, REGISTER_CONCURRENCY_LIMIT))
+    if register_executor._max_workers != conc:
         register_executor = concurrent.futures.ThreadPoolExecutor(max_workers=conc)
     for i in range(count):
         register_executor.submit(_register_worker, i + 1)
-    return {"message": f"成功投递 {count} 个注册任务 (并发 {conc})"}
+    return {
+        "message": (
+            f"成功投递 {count} 个注册任务 (并发 {conc}，"
+            f"上限 {REGISTER_CONCURRENCY_LIMIT})"
+        )
+    }
 
 
 @router.get("/register/status")

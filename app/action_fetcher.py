@@ -43,7 +43,11 @@ def _extract_deployment_id(html: str) -> str:
 
 
 def _extract_chunk_urls(html: str) -> list[str]:
-    return re.findall(r'(?:src|href)=["\'](/_next/static/[^"\']+\.js)["\']', html)
+    """提取 JS chunk URL，兼容 Vercel 新增的 dpl 查询串。"""
+    return list(dict.fromkeys(re.findall(
+        r'(?:src|href)=["\'](/_next/static/[^"\']+\.js(?:\?[^"\']*)?)["\']',
+        html,
+    )))
 
 
 def _extract_action_hashes(js: str) -> list[str]:
@@ -59,6 +63,18 @@ def _extract_action_hashes(js: str) -> list[str]:
         for m in re.finditer(r'"([0-9a-f]{42})"', js):
             found.add(m.group(1))
     return list(found)
+
+
+def _extract_named_actions(js: str) -> dict[str, str]:
+    """从 Turbopack/webpack 产物中提取 action 名称到 hash 的映射。"""
+    found: dict[str, str] = {}
+    pattern = re.compile(
+        r'createServerReference\)?\(\s*"([0-9a-f]{40,44})"'
+        r'[^;]{0,400}?"([A-Za-z_$][A-Za-z0-9_$]*)"\s*\)'
+    )
+    for action_hash, action_name in pattern.findall(js):
+        found[action_name] = action_hash
+    return found
 
 
 def _extract_router_state(html: str) -> str:
@@ -101,9 +117,9 @@ _cfg = ActionConfig()
 
 # 已知的兜底值（网站未更新时仍可用）
 _FALLBACK = {
-    "email_action":  "40adc3232167f83c7900dd653f4b555c9debad554c",
-    "otp_action":    "604662ebbf269723e3fece3fbbe908f39a23b29441",
-    "name_action":   "60a949c1d801e1ed94c06f338559c61c16d5f87f5e",
+    "email_action":  "400c4e30bdcce3a30a5d3f8b241cf5aa7a641def24",
+    "otp_action":    "60fed0a1f5054c7d3703e93c55d809572b1250294e",
+    "name_action":   "60a1d081ceb644ee662d33f415e23e034abdc32003",
     "title_action":  "40713336e55ac49e65d2159f352078f241da2e893a",  # 从抓包提取
     "deployment_id": "dpl_AVKvTSHzb232JfJr7qS6m9dNE7bp",
     "router_state":  (
@@ -143,18 +159,23 @@ async def fetch_action_config(force: bool = False) -> ActionConfig:
 
             # 5. 在 chunks 中搜索 action hashes
             all_hashes: set[str] = set()
+            named_actions: dict[str, str] = {}
             for path in chunk_urls:
                 url = f"{COSVERSE_WEB}{path}"
                 try:
                     js = await _fetch_text(session, url)
                     hashes = _extract_action_hashes(js)
+                    named_actions.update(_extract_named_actions(js))
                     if hashes:
                         all_hashes.update(hashes)
                         log.debug(f"  {path}: {hashes}")
                 except Exception as e:
                     log.debug(f"  跳过 {path}: {e}")
 
-            log.info(f"  共找到 {len(all_hashes)} 个 action hashes: {all_hashes}")
+            log.info(
+                f"  共找到 {len(all_hashes)} 个 action hashes，"
+                f"具名 actions: {sorted(named_actions)}"
+            )
 
             def _pick(prefix: str, fallback: str) -> str:
                 for h in all_hashes:
@@ -162,9 +183,9 @@ async def fetch_action_config(force: bool = False) -> ActionConfig:
                         return h
                 return fallback
 
-            _cfg.email_action  = _pick(_FALLBACK["email_action"],  _FALLBACK["email_action"])
-            _cfg.otp_action    = _pick(_FALLBACK["otp_action"],    _FALLBACK["otp_action"])
-            _cfg.name_action   = _pick(_FALLBACK["name_action"],   _FALLBACK["name_action"])
+            _cfg.email_action  = named_actions.get("sendOTP", _FALLBACK["email_action"])
+            _cfg.otp_action    = named_actions.get("verifyOTP", _FALLBACK["otp_action"])
+            _cfg.name_action   = named_actions.get("addUserName", _FALLBACK["name_action"])
             _cfg.title_action  = _pick(_FALLBACK["title_action"],  _FALLBACK["title_action"])
             _cfg.deployment_id = dep_id  or _FALLBACK["deployment_id"]
             _cfg.router_state  = router  or _FALLBACK["router_state"]

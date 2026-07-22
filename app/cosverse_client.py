@@ -1,14 +1,19 @@
 """
 Cosverse.ai 注册与对话核心逻辑
 """
+import asyncio
 import json
 import logging
 import mimetypes
+import os
 import random
 import re
 import string
+import threading
+import time
+from collections import deque
 from email import message_from_string
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional
 
 from curl_cffi import CurlMime
 from curl_cffi.requests import AsyncSession
@@ -29,6 +34,70 @@ class EmptyResponseError(RuntimeError):
 class ServerError(RuntimeError):
     """Cosverse 服务端应用层错误（如 invalid_grant），无需重试，直接透传给调用方。"""
     pass
+
+
+class OtpSendBlockedError(RuntimeError):
+    """OTP 邮件发送被本地限流器或熔断器阻止。"""
+
+
+class _OtpSendGate:
+    """跨线程/跨事件循环的 OTP 全局限流与熔断器。"""
+
+    def __init__(self) -> None:
+        self.min_interval = max(0.0, float(os.getenv("OTP_MIN_INTERVAL_SECONDS", "12")))
+        self.window_seconds = max(1.0, float(os.getenv("OTP_WINDOW_SECONDS", "300")))
+        self.max_per_window = max(1, int(os.getenv("OTP_MAX_PER_WINDOW", "4")))
+        self.cooldown_seconds = max(1.0, float(os.getenv("OTP_COOLDOWN_SECONDS", "1800")))
+        self.per_email_cooldown = max(
+            0.0, float(os.getenv("OTP_PER_EMAIL_COOLDOWN_SECONDS", "300"))
+        )
+        self._lock = threading.Lock()
+        self._sent_at: deque[float] = deque()
+        self._last_by_email: dict[str, float] = {}
+        self._next_slot_at = 0.0
+        self._blocked_until = 0.0
+        self._blocked_reason = ""
+
+    async def acquire(self, email: str) -> None:
+        normalized = email.strip().lower()
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                if now < self._blocked_until:
+                    remaining = int(self._blocked_until - now) + 1
+                    raise OtpSendBlockedError(
+                        f"OTP 邮箱通道已熔断，{remaining}s 后重试"
+                        + (f"（{self._blocked_reason}）" if self._blocked_reason else "")
+                    )
+
+                while self._sent_at and now - self._sent_at[0] >= self.window_seconds:
+                    self._sent_at.popleft()
+
+                waits = [max(0.0, self._next_slot_at - now)]
+                last_for_email = self._last_by_email.get(normalized, 0.0)
+                waits.append(max(0.0, last_for_email + self.per_email_cooldown - now))
+                if len(self._sent_at) >= self.max_per_window:
+                    waits.append(max(0.0, self._sent_at[0] + self.window_seconds - now))
+                wait_for = max(waits)
+
+                if wait_for <= 0:
+                    self._sent_at.append(now)
+                    self._last_by_email[normalized] = now
+                    self._next_slot_at = now + self.min_interval
+                    return
+
+            log.warning(f"[{email}] OTP 发送限流，等待 {wait_for:.1f}s")
+            await asyncio.sleep(min(wait_for, 60.0))
+
+    def trip(self, reason: str, seconds: Optional[float] = None) -> None:
+        duration = self.cooldown_seconds if seconds is None else max(1.0, seconds)
+        with self._lock:
+            self._blocked_until = max(self._blocked_until, time.monotonic() + duration)
+            self._blocked_reason = reason[:160]
+        log.error(f"OTP 邮箱通道触发熔断 {int(duration)}s：{reason}")
+
+
+_OTP_SEND_GATE = _OtpSendGate()
 
 R2_UPLOAD_URL = f"{COSVERSE_WEB}/api/r2-upload"
 
@@ -62,7 +131,7 @@ def _nextjs_headers(action: str, deployment_id: str, router_state: str) -> dict:
         "referer":                f"{COSVERSE_WEB}/auth/signin",
     }
 
-def _parse_action_response(text: str) -> Optional[dict]:
+def _parse_action_response(text: str) -> Optional[Any]:
     try:
         for line in text.strip().split("\n"):
             if line.startswith("1:"):
@@ -220,31 +289,87 @@ class _LoginMixin:
         self._cookies = _merge_cookies(self._cookies, dict(resp_cookies))
 
     async def _post_action(self, session: AsyncSession, action: str, body: str) -> tuple[int, str]:
-        resp = await session.post(
-            f"{COSVERSE_WEB}/auth/signin",
-            headers=_nextjs_headers(action, self._cfg.deployment_id, self._cfg.router_state),
-            data=body,
-            cookies=self._cookies or None,
-            timeout=20,
-        )
+        async def _post(current_action: str):
+            return await session.post(
+                f"{COSVERSE_WEB}/auth/signin",
+                headers=_nextjs_headers(
+                    current_action,
+                    self._cfg.deployment_id,
+                    self._cfg.router_state,
+                ),
+                data=body,
+                cookies=self._cookies or None,
+                timeout=20,
+            )
+
+        resp = await _post(action)
         self._absorb(resp.cookies)
+
+        stale_hint = resp.text.lower()
+        stale_action = resp.status_code in (404, 410) or any(
+            hint in stale_hint
+            for hint in (
+                "failed to find server action",
+                "server action was not found",
+                "unknown server action",
+            )
+        )
+        if stale_action:
+            action_field = next(
+                (
+                    field
+                    for field in ("email_action", "otp_action", "name_action")
+                    if action == getattr(self._cfg, field, None)
+                ),
+                "",
+            )
+            self._cfg = await fetch_action_config(force=True)
+            refreshed_action = (
+                getattr(self._cfg, action_field, action) if action_field else action
+            )
+            log.warning("检测到 Server Action 已失效，刷新配置后重试一次")
+            resp = await _post(refreshed_action)
+            self._absorb(resp.cookies)
         return resp.status_code, resp.text
 
-    async def _step_send_email(self, session: AsyncSession, email: str) -> bool:
+    async def _step_send_email(
+        self, session: AsyncSession, email: str
+    ) -> Optional[dict[str, Any]]:
+        await _OTP_SEND_GATE.acquire(email)
         status, text = await self._post_action(
             session, self._cfg.email_action, json.dumps([email])
         )
         log.info(f"[{email}] send_email status={status} resp={text[:200]}")
         data = _parse_action_response(text)
-        return bool(data and data.get("success"))
+        error = ""
+        if isinstance(data, dict):
+            error = str(data.get("error") or "")
+        response_hint = f"{error} {text[:500]}".lower()
+        protection_keywords = (
+            "too many", "rate limit", "rate-limit", "temporarily disabled",
+            "email disabled", "email service", "try again later", "429",
+        )
+        if status in (403, 429) or any(k in response_hint for k in protection_keywords):
+            _OTP_SEND_GATE.trip(error or f"HTTP {status}")
+        if status not in (200, 201) or data is None:
+            return None
+        if isinstance(data, dict):
+            if data.get("error") or data.get("success") is False:
+                return None
+            return data
+        return {"success": bool(data)}
 
     async def _step_verify_otp(self, session: AsyncSession, email: str, otp: str) -> bool:
         status, text = await self._post_action(
             session, self._cfg.otp_action, json.dumps([email, otp])
         )
-        log.info(f"[{email}] verify_otp OTP={otp} status={status} resp={text[:300]}")
+        log.info(f"[{email}] verify_otp status={status} resp={text[:300]}")
         data = _parse_action_response(text)
-        return bool(data and data.get("success"))
+        if status not in (200, 201) or data is None:
+            return False
+        if isinstance(data, dict):
+            return not data.get("error") and data.get("success") is not False
+        return bool(data)
 
     async def _step_nextauth_login(self, session: AsyncSession, email: str, otp: str) -> str:
         """
@@ -355,8 +480,11 @@ class CosverseRegister(_LoginMixin):
                 raise RuntimeError("邮箱创建失败")
 
             async with AsyncSession(impersonate=IMPERSONATE, timeout=60) as session:
-                if not await self._step_send_email(session, self.email):
+                otp_request = await self._step_send_email(session, self.email)
+                if not otp_request:
                     raise RuntimeError("Step1 发送邮箱失败")
+                if otp_request.get("newUser") is False:
+                    raise RuntimeError("邮箱已存在，不能按新账号注册")
 
                 self.otp = await self._wait_for_otp(
                     self.email_service, self._jwt, self.email
@@ -503,8 +631,11 @@ class CosverseRefresher(_LoginMixin):
 
             async with AsyncSession(impersonate=IMPERSONATE, timeout=60) as session:
                 # Step 1：触发 OTP 邮件
-                if not await self._step_send_email(session, self.email):
+                otp_request = await self._step_send_email(session, self.email)
+                if not otp_request:
                     raise RuntimeError("Step1 发送邮箱失败")
+                if otp_request.get("newUser") is True:
+                    raise RuntimeError("站点将该邮箱识别为新用户，无法执行已有账号刷新")
 
                 # Step 2：等待并读取 OTP
                 self.otp = await self._wait_for_otp(
@@ -513,16 +644,13 @@ class CosverseRefresher(_LoginMixin):
                 if not self.otp:
                     raise RuntimeError("获取 OTP 超时")
 
-                # Step 3：验证 OTP
-                if not await self._step_verify_otp(session, self.email, self.otp):
-                    raise RuntimeError("Step2 OTP 验证失败")
-
-                # Step 4：nextauth 登录（注意：保活不走 set_name）
+                # 新版站点对已有账号不再先调用 verifyOTP；前端会直接把 OTP
+                # 交给 credentials provider。提前 verify 会消费验证码，导致登录失败。
                 user_id = await self._step_nextauth_login(
                     session, self.email, self.otp
                 )
                 if not user_id:
-                    raise RuntimeError("Step3 next-auth 登录失败，session 未返回 user_id")
+                    raise RuntimeError("Step2 next-auth 登录失败，session 未返回 user_id")
 
             # ✅ 写回 AccountState
             self.acc.cookie_str = _cookies_dict_to_str(self._cookies)
@@ -649,6 +777,7 @@ async def stream_cosverse_response(
     provider: str = "google",
     attachments: Optional[list[dict]] = None,
     conv_id: Optional[str] = None,
+    generate_title: bool = True,
 ) -> AsyncIterator[str]:
     """
     向 Cosverse /api/chat 发送请求并流式返回文本块。
@@ -661,7 +790,10 @@ async def stream_cosverse_response(
     cfg = await fetch_action_config()
 
     async with AsyncSession(impersonate=IMPERSONATE, timeout=120) as session:
-        chat_title = await _fetch_chat_title(session, text, acc, conv_id, cfg)
+        chat_title = (
+            await _fetch_chat_title(session, text, acc, conv_id, cfg)
+            if generate_title else "New Chat"
+        )
         body = _chat_body(conv_id, text, model, provider, acc.name or acc.email, attachments, chat_title)
 
         resp = await session.post(
