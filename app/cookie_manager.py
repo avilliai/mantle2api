@@ -57,23 +57,26 @@ class CookieManager:
             return
         try:
             data = json.loads(TOKENS_FILE.read_text(encoding="utf-8"))
+            purged_exhausted: list[str] = []
             with self._sync_lock:
                 accounts = []
                 for i, d in enumerate(data):
                     if not d.get("cookie_str"):
                         continue
+                    if int(d.get("usage_count", 0) or 0) >= ACCOUNT_MAX_USAGE:
+                        purged_exhausted.append(d.get("email", f"index-{i + 1}"))
+                        continue
                     acc = AccountState(d, i + 1)
                     # 恢复 email_jwt（保活时收 OTP 必须）
                     if d.get("email_jwt"):
                         acc.email_jwt = d["email_jwt"]
-                    # 恢复 reset_at（24h 配额重置时间戳）
-                    if d.get("reset_at"):
-                        acc.reset_at = d["reset_at"]
                     # 恢复 fail_count（连续失败计数，用于活跃池淘汰判断）
                     acc.fail_count = d.get("fail_count", 0)
                     accounts.append(acc)
                 self.accounts = accounts
             log.info(f"✅ 成功加载账号: {len(self.accounts)} 个")
+            if purged_exhausted:
+                log.info(f"🗑️ 启动时清理已耗尽账号: {purged_exhausted}")
 
             # 恢复活跃池：优先使用持久化的 active_pool 字段；
             # 若文件中没有（旧版本数据/首次升级），则用启发式规则重建。
@@ -99,10 +102,12 @@ class CookieManager:
                 # 不适合在这里同步阻塞地逐个收验证码邮件激活。
                 # 因此这里不直接把账号塞进 active_pool，而是保持空池，
                 # 由 main.py 启动后调用的 _replenish_active_pool() 异步任务
-                # 统一走"先 refresh 激活成功才入池"的流程来填充。
+                # 统一走"先 hello 探活成功才入池"的流程来填充。
                 log.info("♻️ 未找到可用的活跃池快照，活跃池将在启动后异步激活补充")
             else:
                 log.info(f"✅ 已恢复活跃池: {len(self.active_pool)} 个账号 {self.active_pool}")
+            if purged_exhausted:
+                self.save()
         except Exception as e:
             log.error(f"解析 tokens 失败: {e}")
 
@@ -116,10 +121,6 @@ class CookieManager:
                     email_jwt = getattr(acc, "email_jwt", "")
                     if email_jwt:
                         d["email_jwt"] = email_jwt
-                    # reset_at：24h 配额重置时间戳
-                    reset_at = getattr(acc, "reset_at", 0)
-                    if reset_at:
-                        d["reset_at"] = reset_at
                     # fail_count：连续失败次数（用于活跃池淘汰判断）
                     fail_count = getattr(acc, "fail_count", 0)
                     if fail_count:
@@ -144,25 +145,18 @@ class CookieManager:
 
     # ── 提供给管理后台接口的数据 ──────────────────────────
     def get_tokens_detail(self) -> dict:
-        import time
         tokens_list = []
         total_remaining = 0
         alive_count = 0
-        now = time.time()
 
         with self._sync_lock:
             pool_set = set(self.active_pool)
             for acc in self.accounts:
-                # 计算剩余量时考虑 24h 重置：若已过 24h，usage 视为 0
-                reset_at  = getattr(acc, "reset_at", 0) or 0
-                effective_usage = acc.usage_count if (now - reset_at < 86400) else 0
-                remaining = max(0, ACCOUNT_MAX_USAGE - effective_usage)
+                remaining = max(0, ACCOUNT_MAX_USAGE - acc.usage_count)
                 total_remaining += remaining
 
                 if acc.healthy and not acc.disabled and remaining > 0:
                     alive_count += 1
-
-                next_reset_in = max(0, int(86400 - (now - reset_at))) if reset_at else None
 
                 tokens_list.append({
                     "index":          acc.index,
@@ -171,7 +165,6 @@ class CookieManager:
                     "is_alive":       acc.healthy,
                     "disabled":       acc.disabled,
                     "remaining":      remaining,
-                    "next_reset_in":  next_reset_in,   # 距下次重置的秒数
                     "in_active_pool": acc.index in pool_set,
                     "fail_count":     getattr(acc, "fail_count", 0),
                 })
@@ -191,6 +184,19 @@ class CookieManager:
 
     # ── 账号增删 ──────────────────────────────────────────
     def add_account(self, data: dict) -> bool:
+        if int(data.get("usage_count", 0) or 0) >= ACCOUNT_MAX_USAGE:
+            email = data.get("email", "")
+            with self._sync_lock:
+                removed_indexes = {
+                    acc.index for acc in self.accounts if acc.email == email
+                }
+                self.accounts = [acc for acc in self.accounts if acc.email != email]
+                self.active_pool = [
+                    idx for idx in self.active_pool if idx not in removed_indexes
+                ]
+            log.warning(f"忽略并清理已耗尽账号: {email or '<unknown>'}")
+            return False
+
         with self._sync_lock:
             for acc in self.accounts:
                 if acc.email == data.get("email"):
@@ -222,6 +228,24 @@ class CookieManager:
         if getattr(acc, "fail_count", 0) >= FAIL_THRESHOLD:
             return False
         return True
+
+    def _discard_account(self, acc: AccountState, reason: str) -> bool:
+        """从账号列表和活跃池永久删除一个不可再用的账号。"""
+        with self._sync_lock:
+            before = len(self.accounts)
+            self.accounts = [
+                candidate
+                for candidate in self.accounts
+                if candidate is not acc and candidate.index != acc.index
+            ]
+            self.active_pool = [
+                idx for idx in self.active_pool if idx != acc.index
+            ]
+            removed = len(self.accounts) < before
+        if removed:
+            self.save()
+            log.info(f"🗑️ [{acc.email}] 已永久删除，原因: {reason}")
+        return removed
 
     async def _evict_from_pool(self, acc: AccountState, reason: str) -> None:
         """将账号请出活跃池（配额耗尽或连续失败），并触发补充。"""
@@ -494,10 +518,6 @@ class CookieManager:
 
     # ── 轮询获取可用账号 ──────────────────────────────────
     async def get_next(self) -> AccountState:
-        # 24h 配额重置检查（无锁，属性赋值原子性由 GIL 保证）
-        for a in self.accounts:
-            self._maybe_reset_usage(a)
-
         with self._sync_lock:
             pool_set = set(self.active_pool)
             valid = [
@@ -523,7 +543,7 @@ class CookieManager:
             acc = valid[self._idx % len(valid)]
             self._idx += 1
 
-        # 池内账号若因 24h 重置等原因数量低于阈值，异步触发补充（不阻塞当前请求）
+        # 活跃池数量低于阈值时，异步触发补充（不阻塞当前请求）
         if len(valid) < ACTIVE_POOL_SIZE:
             asyncio.create_task(self._replenish_active_pool())
 
@@ -545,6 +565,21 @@ class CookieManager:
           （优先从备用池选健康账号，不够再注册新账号）；同时尝试一次保活作为最后挽救，
           失败则彻底放弃该账号，改用活跃池中的其他账号或新账号。
         """
+        if reason == "quota_exhausted":
+            self._discard_account(acc, reason)
+            await self._replenish_active_pool()
+            with self._sync_lock:
+                pool_set = set(self.active_pool)
+                valid = [
+                    candidate
+                    for candidate in self.accounts
+                    if candidate.index in pool_set
+                    and self._account_is_eligible(candidate)
+                ]
+            if valid:
+                return valid[0]
+            raise HTTPException(500, "额度耗尽账号已删除，但没有可用的替代账号")
+
         async with self._async_lock:
             acc.fail_count = getattr(acc, "fail_count", 0) + 1
             log.warning(
@@ -630,33 +665,7 @@ class CookieManager:
         raise HTTPException(500, "换号重试失败：无备用账号且自动注册/保活均未成功")
 
     # ── 用量记账 ──────────────────────────────────────────
-    def _maybe_reset_usage(self, acc: AccountState) -> None:
-        """
-        如果距离上次重置已超过 24h，将 usage_count 归零并重新启用账号。
-        reset_at 字段记录上次重置的 Unix 时间戳（秒），持久化在 tokens.json 中。
-        """
-        import time
-        now = time.time()
-        reset_at = getattr(acc, "reset_at", 0) or 0
-        if now - reset_at >= 86400:  # 24 小时 = 86400 秒
-            if acc.usage_count > 0 or acc.disabled:
-                log.info(
-                    f"[{acc.email}] ♻️  24h 配额重置 "
-                    f"(距上次重置 {int((now - reset_at) / 3600)}h)，"
-                    f"usage_count {acc.usage_count} → 0"
-                )
-            acc.usage_count = 0
-            acc.reset_at    = now
-            acc.fail_count  = 0
-            # 仅因额度耗尽而被禁用的账号（healthy=True），重置后自动解禁
-            if acc.disabled and acc.healthy:
-                acc.disabled = False
-                log.info(f"[{acc.email}] ♻️  额度已重置，自动解禁")
-
     def record_usage(self, acc: AccountState) -> None:
-        # 先检查是否需要重置 24h 配额
-        self._maybe_reset_usage(acc)
-
         if hasattr(acc, "increment_usage"):
             acc.increment_usage()
         else:
@@ -667,15 +676,20 @@ class CookieManager:
 
         quota_exhausted = acc.usage_count >= ACCOUNT_MAX_USAGE
         if quota_exhausted:
-            acc.disabled = True
-            log.info(f"🚫 [{acc.email}] 额度已达 {ACCOUNT_MAX_USAGE}，自动禁用。")
+            removed = self._discard_account(
+                acc, f"usage_count_reached_{ACCOUNT_MAX_USAGE}"
+            )
+            if removed:
+                try:
+                    asyncio.get_running_loop().create_task(
+                        self._replenish_active_pool()
+                    )
+                except RuntimeError:
+                    pass
+            return
 
         self.save()
         log.info(f"📈 [{acc.email}] 已用: {acc.usage_count}/{ACCOUNT_MAX_USAGE}")
-
-        # 配额耗尽：请出活跃池，异步补充新账号（不阻塞当前请求的返回）
-        if quota_exhausted:
-            asyncio.create_task(self._evict_from_pool(acc, reason="quota_exhausted"))
 
     # ── 账号 session 检查（LLM 探活） ────────────────────
     async def check_session(self, acc: AccountState, save: bool = True) -> bool:

@@ -1,6 +1,6 @@
 # app/models.py
 
-ACCOUNT_QUOTA = 100  # 每个账号限额 100 次
+ACCOUNT_QUOTA = 100  # 每个账号永久限额 100 次，上游不会重置
 
 class AccountState:
     def __init__(self, d: dict, index: int = 1):
@@ -55,7 +55,7 @@ class AccountState:
         return res
 
     def increment_usage(self) -> None:
-        """递增用量，达到上限时自动禁用"""
+        """递增用量；达到上限后由 CookieManager 永久删除账号"""
         self.usage_count += 1
         if self.quota_exhausted:
             self.disabled = True
