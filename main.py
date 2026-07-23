@@ -71,7 +71,7 @@ async def keep_alive_task():
     while True:
         try:
             _ka_log.info("🔄 开始执行定时保活...")
-            await cm.keepalive_tick()
+            #await cm.keepalive_tick()
             _ka_log.info(f"✅ 保活完成，下次执行在 {KEEPALIVE_INTERVAL // 60} 分钟后")
         except asyncio.CancelledError:
             _ka_log.info("保活任务已取消")

@@ -86,8 +86,8 @@ class _OtpSendGate:
                     self._next_slot_at = now + self.min_interval
                     return
 
-            log.warning(f"[{email}] OTP 发送限流，等待 {wait_for:.1f}s")
-            await asyncio.sleep(min(wait_for, 60.0))
+            log.warning(f"[{email}] OTP 发送限流，等待 s")
+            await asyncio.sleep(3)
 
     def trip(self, reason: str, seconds: Optional[float] = None) -> None:
         duration = self.cooldown_seconds if seconds is None else max(1.0, seconds)
@@ -335,7 +335,7 @@ class _LoginMixin:
     async def _step_send_email(
         self, session: AsyncSession, email: str
     ) -> Optional[dict[str, Any]]:
-        await _OTP_SEND_GATE.acquire(email)
+        #await _OTP_SEND_GATE.acquire(email)
         status, text = await self._post_action(
             session, self._cfg.email_action, json.dumps([email])
         )
@@ -613,6 +613,7 @@ class CosverseRefresher(_LoginMixin):
     async def run(self) -> bool:
         """
         执行保活。成功后更新 acc.cookie_str / acc.healthy / acc.disabled。
+        遇到 429 时重新执行完整的 OTP 获取 + 登录流程（最多重试 OTP_RETRY_COUNT 次）。
         :return: True=成功，False=失败
         """
         try:
@@ -628,36 +629,61 @@ class CosverseRefresher(_LoginMixin):
                 )
 
             email_service = EmailService()
+            max_retries = max(1, int(os.getenv("OTP_RETRY_COUNT", "3")))
+            retry_delay = max(5.0, float(os.getenv("OTP_RETRY_DELAY_SECONDS", "30")))
 
-            async with AsyncSession(impersonate=IMPERSONATE, timeout=60) as session:
-                # Step 1：触发 OTP 邮件
-                otp_request = await self._step_send_email(session, self.email)
-                if not otp_request:
-                    raise RuntimeError("Step1 发送邮箱失败")
-                if otp_request.get("newUser") is True:
-                    raise RuntimeError("站点将该邮箱识别为新用户，无法执行已有账号刷新")
+            for attempt in range(1, max_retries + 1):
+                async with AsyncSession(impersonate=IMPERSONATE, timeout=60) as session:
+                    # Step 1：触发 OTP 邮件（429 时等待后重试）
+                    otp_request = await self._step_send_email(session, self.email)
+                    if not otp_request:
+                        if attempt < max_retries:
+                            log.warning(
+                                f"[{self.email}] OTP 发送失败（attempt {attempt}/{max_retries}），"
+                                f"{retry_delay}s 后重新执行完整登录流程..."
+                            )
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        raise RuntimeError(f"Step1 发送邮箱失败（已重试 {max_retries} 次）")
 
-                # Step 2：等待并读取 OTP
-                self.otp = await self._wait_for_otp(
-                    email_service, self._email_jwt, self.email
-                )
-                if not self.otp:
-                    raise RuntimeError("获取 OTP 超时")
+                    if otp_request.get("newUser") is True:
+                        raise RuntimeError("站点将该邮箱识别为新用户，无法执行已有账号刷新")
 
-                # 新版站点对已有账号不再先调用 verifyOTP；前端会直接把 OTP
-                # 交给 credentials provider。提前 verify 会消费验证码，导致登录失败。
-                user_id = await self._step_nextauth_login(
-                    session, self.email, self.otp
-                )
-                if not user_id:
-                    raise RuntimeError("Step2 next-auth 登录失败，session 未返回 user_id")
+                    # Step 2：等待并读取 OTP
+                    self.otp = await self._wait_for_otp(
+                        email_service, self._email_jwt, self.email
+                    )
+                    if not self.otp:
+                        if attempt < max_retries:
+                            log.warning(
+                                f"[{self.email}] 获取 OTP 超时（attempt {attempt}/{max_retries}），"
+                                f"{retry_delay}s 后重试..."
+                            )
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        raise RuntimeError("获取 OTP 超时")
 
-            # ✅ 写回 AccountState
-            self.acc.cookie_str = _cookies_dict_to_str(self._cookies)
-            self.acc.healthy    = True
-            self.acc.disabled   = False
-            log.info(f"[{self.email}] ✅ 保活成功，cookie 已更新")
-            return True
+                    # 新版站点对已有账号不再先调用 verifyOTP；前端会直接把 OTP
+                    # 交给 credentials provider。提前 verify 会消费验证码，导致登录失败。
+                    user_id = await self._step_nextauth_login(
+                        session, self.email, self.otp
+                    )
+                    if not user_id:
+                        if attempt < max_retries:
+                            log.warning(
+                                f"[{self.email}] next-auth 登录失败（attempt {attempt}/{max_retries}），"
+                                f"{retry_delay}s 后重试..."
+                            )
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        raise RuntimeError("Step2 next-auth 登录失败，session 未返回 user_id")
+
+                    # ✅ 写回 AccountState
+                    self.acc.cookie_str = _cookies_dict_to_str(self._cookies)
+                    self.acc.healthy    = True
+                    self.acc.disabled   = False
+                    log.info(f"[{self.email}] ✅ 保活成功，cookie 已更新（attempt {attempt}）")
+                    return True
 
         except Exception as e:
             log.error(f"[{self.email}] ❌ 保活失败: {e}")

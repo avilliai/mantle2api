@@ -477,36 +477,28 @@ class CookieManager:
             f"需刷新 {probe_counter['dead']}，共 {len(candidates)} 个"
         )
 
-        # 默认不对探活失败账号自动发 OTP；仅在显式开启时受控刷新。
         evict_targets: list[AccountState] = []
         if dead_accounts:
-            if not AUTO_OTP_REFRESH:
-                log.warning(
-                    f"⏰ {len(dead_accounts)} 个账号 hello 探活失败；"
-                    "AUTO_OTP_REFRESH=false，直接移出活跃池"
-                )
-                evict_targets.extend(dead_accounts)
-            else:
-                limited_dead = dead_accounts[:max(0, AUTO_OTP_REFRESH_MAX_PER_TICK)]
-                evict_targets.extend(dead_accounts[len(limited_dead):])
-                log.info(f"⏰ 开始对 {len(limited_dead)} 个失效账号执行受控 refresh...")
-                refresh_counter = {"ok": 0, "fail": 0}
+            limited_dead = dead_accounts[:max(0, AUTO_OTP_REFRESH_MAX_PER_TICK)] if AUTO_OTP_REFRESH else dead_accounts
+            evict_targets.extend(dead_accounts[len(limited_dead):])
+            log.info(f"⏰ 开始对 {len(limited_dead)} 个失效账号执行 refresh...")
+            refresh_counter = {"ok": 0, "fail": 0}
 
-                async def _bounded_refresh(acc):
-                    async with sem:
-                        ok = await self.refresh_account(acc)
-                        if ok:
-                            refresh_counter["ok"] += 1
-                            acc.fail_count = 0
-                        else:
-                            refresh_counter["fail"] += 1
-                            evict_targets.append(acc)
+            async def _bounded_refresh(acc):
+                async with sem:
+                    ok = await self.refresh_account(acc)
+                    if ok:
+                        refresh_counter["ok"] += 1
+                        acc.fail_count = 0
+                    else:
+                        refresh_counter["fail"] += 1
+                        evict_targets.append(acc)
 
-                await asyncio.gather(*[_bounded_refresh(a) for a in limited_dead])
-                log.info(
-                    f"⏰ refresh 完成：成功 {refresh_counter['ok']}，"
-                    f"失败 {refresh_counter['fail']}"
-                )
+            await asyncio.gather(*[_bounded_refresh(a) for a in limited_dead])
+            log.info(
+                f"⏰ refresh 完成：成功 {refresh_counter['ok']}，"
+                f"失败 {refresh_counter['fail']}"
+            )
         else:
             log.info("⏰ 活跃池内账号均存活，无需 refresh。")
 
@@ -608,20 +600,21 @@ class CookieManager:
                     asyncio.create_task(self._evict_from_pool(acc, reason=reason))
                 return valid[0]
 
-            if not reached_threshold:
-                # 还没到淘汰阈值，但活跃池里暂时没有其他备用号了；
-                # 先尝试对该账号保活，能恢复就继续用它，比直接换号/注册更轻量。
-                if AUTO_OTP_REFRESH:
-                    log.warning(f"⚠️ 活跃池暂无其他备用号，受控保活 [{acc.email}]...")
-                    ok = await self.refresh_account(acc)
-                    if ok:
-                        acc.fail_count = 0
-                        log.info(f"✅ 保活成功，继续使用 [{acc.email}]")
-                        return acc
-                # 保活失败则视同达到阈值，请出活跃池
-                acc.healthy  = False
-                acc.disabled = True
+            # 活跃池暂无其他备用号，先尝试保活当前账号
+            log.warning(f"⚠️ 活跃池暂无其他备用号，尝试保活 [{acc.email}]...")
+            acc.disabled = False
+            ok = await self.refresh_account(acc)
+            if ok:
+                acc.fail_count = 0
+                acc.healthy = True
+                acc.disabled = False
                 self.save()
+                log.info(f"✅ 保活成功，继续使用 [{acc.email}]")
+                return acc
+            # 保活失败则视同达到阈值，请出活跃池
+            acc.healthy  = False
+            acc.disabled = True
+            self.save()
 
         # 走到这里：账号已确认故障（达到阈值或保活失败），请出活跃池并补充
         await self._evict_from_pool(acc, reason=reason)
