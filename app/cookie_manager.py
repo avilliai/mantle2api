@@ -4,9 +4,11 @@ import asyncio
 import json
 import logging
 import os
+import random
 import threading
 from typing import Optional
 
+import dotenv
 from fastapi import HTTPException
 
 from app.config import TOKENS_FILE
@@ -16,15 +18,15 @@ log = logging.getLogger("cosverse_proxy.cookie_manager")
 
 PRE_REGISTER_THRESHOLD = 2
 ACCOUNT_MAX_USAGE = 100
-
+dotenv.load_dotenv()
 # ── 动态账号池配置 ──────────────────────────────────────────
 # 不再对全量账号做批量保活（高频探活会触发验证码风控）。
 # 改为只维护一个小的"活跃池"，仅对池内账号做探活/保活；
 # 池内账号配额耗尽或连续失败达到阈值时被请出池子，
 # 再从备用账号（健康但不在池内）或新注册账号中补充。
 ACTIVE_POOL_SIZE = int(os.environ.get("ACTIVE_POOL_SIZE", "10"))
-REPLENISH_BATCH  = int(os.environ.get("REPLENISH_BATCH", "3"))
-FAIL_THRESHOLD   = int(os.environ.get("ACCOUNT_FAIL_THRESHOLD", "3"))
+REPLENISH_BATCH = int(os.environ.get("REPLENISH_BATCH", "6"))
+FAIL_THRESHOLD = int(os.environ.get("ACCOUNT_FAIL_THRESHOLD", "3"))
 REPLENISH_PROBE_LIMIT = int(os.environ.get("REPLENISH_PROBE_LIMIT", "20"))
 AUTO_OTP_REFRESH = os.environ.get("AUTO_OTP_REFRESH", "false").lower() in ("1", "true", "yes")
 AUTO_OTP_REFRESH_MAX_PER_TICK = int(
@@ -33,21 +35,22 @@ AUTO_OTP_REFRESH_MAX_PER_TICK = int(
 AUTO_REGISTER_ON_REPLENISH = os.environ.get(
     "AUTO_REGISTER_ON_REPLENISH", "false"
 ).lower() in ("1", "true", "yes")
+print(AUTO_REGISTER_ON_REPLENISH)
 
 
 class CookieManager:
     def __init__(self):
         self.accounts: list[AccountState] = []
         self._idx: int = 0
-        self._async_lock = asyncio.Lock()   # 仅保护换号/注册等写操作
-        self._idx_lock   = asyncio.Lock()   # 仅保护 _idx 轮询，极短临界区
-        self._sync_lock  = threading.Lock()
+        self._async_lock = asyncio.Lock()  # 仅保护换号/注册等写操作
+        self._idx_lock = asyncio.Lock()  # 仅保护 _idx 轮询，极短临界区
+        self._sync_lock = threading.Lock()
         self._registering = False
 
         # ── 动态账号池 ──────────────────────────────────────
-        self.active_pool: list[int] = []          # 活跃账号的 index 列表
-        self._pool_lock = asyncio.Lock()           # 保护活跃池增删
-        self._replenishing = False                 # 防止补号任务并发重入
+        self.active_pool: list[int] = []  # 活跃账号的 index 列表
+        self._pool_lock = asyncio.Lock()  # 保护活跃池增删
+        self._replenishing = False  # 防止补号任务并发重入
 
     # ── 持久化 ────────────────────────────────────────────
     def load(self) -> None:
@@ -92,7 +95,7 @@ class CookieManager:
             self.active_pool = [
                 idx for idx in restored_pool
                 if idx in valid_indices
-                and self._account_is_eligible(self._find_by_index(idx))
+                   and self._account_is_eligible(self._find_by_index(idx))
             ]
 
             if not self.active_pool:
@@ -159,26 +162,26 @@ class CookieManager:
                     alive_count += 1
 
                 tokens_list.append({
-                    "index":          acc.index,
-                    "email":          acc.email,
-                    "token_hint":     getattr(acc, "token_hint", acc.email),
-                    "is_alive":       acc.healthy,
-                    "disabled":       acc.disabled,
-                    "remaining":      remaining,
+                    "index": acc.index,
+                    "email": acc.email,
+                    "token_hint": getattr(acc, "token_hint", acc.email),
+                    "is_alive": acc.healthy,
+                    "disabled": acc.disabled,
+                    "remaining": remaining,
                     "in_active_pool": acc.index in pool_set,
-                    "fail_count":     getattr(acc, "fail_count", 0),
+                    "fail_count": getattr(acc, "fail_count", 0),
                 })
             pool_size = len(self.active_pool)
 
         return {
             "tokens": tokens_list,
             "summary": {
-                "total":             len(self.accounts),
-                "alive":             alive_count,
-                "total_remaining":   total_remaining,
-                "active_pool_size":  pool_size,
+                "total": len(self.accounts),
+                "alive": alive_count,
+                "total_remaining": total_remaining,
+                "active_pool_size": pool_size,
                 "active_pool_target": ACTIVE_POOL_SIZE,
-                "last_refresh":    None,
+                "last_refresh": None,
             },
         }
 
@@ -200,10 +203,10 @@ class CookieManager:
         with self._sync_lock:
             for acc in self.accounts:
                 if acc.email == data.get("email"):
-                    acc.cookie_str  = data.get("cookie_str", acc.cookie_str)
-                    acc.name        = data.get("name", acc.name)
-                    acc.user_id     = data.get("user_id", acc.user_id)
-                    acc.healthy     = True
+                    acc.cookie_str = data.get("cookie_str", acc.cookie_str)
+                    acc.name = data.get("name", acc.name)
+                    acc.user_id = data.get("user_id", acc.user_id)
+                    acc.healthy = True
                     acc.usage_count = data.get("usage_count", acc.usage_count)
                     # 更新 email_jwt（如果注册时带回来了）
                     if data.get("email_jwt"):
@@ -289,9 +292,9 @@ class CookieManager:
                 log.info(f"👋 备用账号先执行 hello 探活: {acc.email}")
                 ok = await self.check_session(acc, save=False)
                 if (
-                    not ok
-                    and AUTO_OTP_REFRESH
-                    and otp_refreshes < AUTO_OTP_REFRESH_MAX_PER_TICK
+                        not ok
+                        and AUTO_OTP_REFRESH
+                        and otp_refreshes < AUTO_OTP_REFRESH_MAX_PER_TICK
                 ):
                     otp_refreshes += 1
                     log.warning(f"🔑 hello 探活失败，受控 OTP 刷新: {acc.email}")
@@ -336,9 +339,12 @@ class CookieManager:
                     f"活跃池仍缺 {need} 个账号；自动注册已关闭，"
                     "不会触发额外 OTP 邮件"
                 )
+
+            # 活跃池补充完成后，顺带检查并触发备用池的后台平滑补充
+            await self._ensure_spare_accounts()
+
         finally:
             self._replenishing = False
-
 
     async def _register_new_account(self) -> Optional[AccountState]:
         try:
@@ -363,21 +369,56 @@ class CookieManager:
         return await self._register_new_account()
 
     async def _ensure_spare_accounts(self) -> None:
+        """后台预注册：确保可用账号总数始终等于活跃池的 2 倍"""
         if not AUTO_REGISTER_ON_REPLENISH:
             return
         if self._registering:
             return
+
+        # 目标总数 = 活跃池大小 * 2
+        target_count = ACTIVE_POOL_SIZE * 2
+
+        # 统计未耗尽可用额度的账号数量（包括活跃池 + 备用池）
         valid_count = sum(
             1 for a in self.accounts
-            if a.healthy and not a.disabled and a.usage_count < ACCOUNT_MAX_USAGE
+            if a.usage_count < ACCOUNT_MAX_USAGE
         )
-        if valid_count < PRE_REGISTER_THRESHOLD:
-            self._registering = True
-            asyncio.create_task(self._bg_register())
 
-    async def _bg_register(self) -> None:
+        if valid_count < target_count:
+            self._registering = True
+            log.info(f"🔄 触发备用池补充：当前总号数 {valid_count}，目标 {target_count}，启动后台平滑注册...")
+            asyncio.create_task(self._bg_register(target_count))
+
+    async def _bg_register(self, target_count: int) -> None:
+        """平滑后台注册循环：直到数量达标"""
         try:
-            await self._register_new_account()
+            while True:
+                # 每次循环重新统计，防并发淘汰导致的数据变更
+                valid_count = sum(
+                    1 for a in self.accounts
+                    if a.usage_count < ACCOUNT_MAX_USAGE
+                )
+
+                need = target_count - valid_count
+                if need <= 0:
+                    log.info("✅ 账号总池数量已达标 (活跃池*2)，后台注册平滑退出")
+                    break
+
+                log.info(f"🆕 后台预注册：还需补充 {need} 个账号 (当前进度 {valid_count}/{target_count})")
+                new_acc = await self._register_new_account()
+
+                if not new_acc:
+                    log.warning("⚠️ 后台注册失败，暂时中止循环，留待下次探活时重试以避免风控")
+                    break
+
+                # 平滑过渡策略：如果还需要继续注册，随机休眠 15~30 秒，避免高频请求被封 IP
+                if need > 1:
+                    sleep_time = random.uniform(1, 5)
+                    log.info(f"⏳ 注册成功，休眠 {sleep_time:.1f} 秒以实现平滑过渡...")
+                    await asyncio.sleep(sleep_time)
+
+        except Exception as e:
+            log.error(f"后台预注册循环异常: {e}")
         finally:
             self._registering = False
 
@@ -417,7 +458,7 @@ class CookieManager:
             acc.disabled = False
             ok = await self.refresh_account(acc)
             (success if ok else failed).append(acc.email)
-            await asyncio.sleep(2)   # 错峰，避免短时间内大量请求
+            await asyncio.sleep(2)  # 错峰，避免短时间内大量请求
 
         log.info(f"批量保活完成：成功 {len(success)}，失败 {len(failed)}")
         return {"success": success, "failed": failed}
@@ -506,6 +547,9 @@ class CookieManager:
         for acc in evict_targets:
             await self._evict_from_pool(acc, reason="keepalive_refresh_failed")
 
+        # 每次定期保活任务结束前，自动检查整体总池子是否满足 2倍 目标
+        await self._ensure_spare_accounts()
+
         log.info("⏰ keepalive_tick 完成")
 
     # ── 轮询获取可用账号 ──────────────────────────────────
@@ -566,7 +610,7 @@ class CookieManager:
                     candidate
                     for candidate in self.accounts
                     if candidate.index in pool_set
-                    and self._account_is_eligible(candidate)
+                       and self._account_is_eligible(candidate)
                 ]
             if valid:
                 return valid[0]
@@ -581,7 +625,7 @@ class CookieManager:
 
             reached_threshold = acc.fail_count >= FAIL_THRESHOLD
             if reached_threshold:
-                acc.healthy  = False
+                acc.healthy = False
                 acc.disabled = True
             self.save()
 
@@ -591,8 +635,8 @@ class CookieManager:
                 valid = [
                     a for a in self.accounts
                     if a.index in pool_set
-                    and a.index != acc.index
-                    and self._account_is_eligible(a)
+                       and a.index != acc.index
+                       and self._account_is_eligible(a)
                 ]
             if valid:
                 log.info(f"🔄 切换到活跃池内备用账号: {valid[0].email}")
@@ -612,7 +656,7 @@ class CookieManager:
                 log.info(f"✅ 保活成功，继续使用 [{acc.email}]")
                 return acc
             # 保活失败则视同达到阈值，请出活跃池
-            acc.healthy  = False
+            acc.healthy = False
             acc.disabled = True
             self.save()
 
@@ -622,7 +666,7 @@ class CookieManager:
         # attempt >= 3：先尝试对该账号保活，保活失败再依赖补充逻辑给出新账号
         if attempt >= 3 and AUTO_OTP_REFRESH:
             log.warning(f"⚠️ 第 {attempt} 次重试，最后尝试保活 [{acc.email}]...")
-            acc.disabled = False   # 解禁才能保活
+            acc.disabled = False  # 解禁才能保活
             ok = await self.refresh_account(acc)
             if ok:
                 acc.fail_count = 0
@@ -674,9 +718,10 @@ class CookieManager:
             )
             if removed:
                 try:
-                    asyncio.get_running_loop().create_task(
-                        self._replenish_active_pool()
-                    )
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self._replenish_active_pool())
+                    # 额度耗尽淘汰旧号时，触发预注册以补充被销毁的空缺
+                    loop.create_task(self._ensure_spare_accounts())
                 except RuntimeError:
                     pass
             return
@@ -701,11 +746,11 @@ class CookieManager:
             model_id, provider = resolve_model(probe_model)
             chunks = []
             async for chunk in stream_cosverse_response(
-                text=probe_text,
-                acc=acc,
-                model=model_id,
-                provider=provider,
-                generate_title=False,
+                    text=probe_text,
+                    acc=acc,
+                    model=model_id,
+                    provider=provider,
+                    generate_title=False,
             ):
                 chunks.append(chunk)
                 # 拿到第一个非空 chunk 即可确认存活，提前退出
