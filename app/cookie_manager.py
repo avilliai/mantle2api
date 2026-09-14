@@ -25,8 +25,8 @@ dotenv.load_dotenv()
 # 改为只维护一个小的"活跃池"，仅对池内账号做探活/保活；
 # 池内账号配额耗尽或连续失败达到阈值时被请出池子，
 # 再从备用账号（健康但不在池内）或新注册账号中补充。
-ACTIVE_POOL_SIZE = int(os.environ.get("ACTIVE_POOL_SIZE", "11"))
-REPLENISH_BATCH = int(os.environ.get("REPLENISH_BATCH", "8"))
+ACTIVE_POOL_SIZE = int(os.environ.get("ACTIVE_POOL_SIZE", "3"))
+REPLENISH_BATCH = int(os.environ.get("REPLENISH_BATCH", "3"))
 FAIL_THRESHOLD = int(os.environ.get("ACCOUNT_FAIL_THRESHOLD", "3"))
 REPLENISH_PROBE_LIMIT = int(os.environ.get("REPLENISH_PROBE_LIMIT", "20"))
 AUTO_OTP_REFRESH = os.environ.get("AUTO_OTP_REFRESH", "false").lower() in ("1", "true", "yes")
@@ -103,7 +103,7 @@ class CookieManager:
                 # 不适合在这里同步阻塞地逐个收验证码邮件激活。
                 # 因此这里不直接把账号塞进 active_pool，而是保持空池，
                 # 由 main.py 启动后调用的 _replenish_active_pool() 异步任务
-                # 统一走"先 hello 探活成功才入池"的流程来填充。
+                # 统一走 usage 余额探测成功才入池。
                 log.info("♻️ 未找到可用的活跃池快照，活跃池将在启动后异步激活补充")
             else:
                 log.info(f"✅ 已恢复活跃池: {len(self.active_pool)} 个账号 {self.active_pool}")
@@ -247,7 +247,7 @@ class CookieManager:
     async def _replenish_active_pool(self) -> None:
         """
         补充活跃池至 ACTIVE_POOL_SIZE：
-        - 备用账号先发送 hello 做真实 LLM 探活，成功后直接加入活跃池。
+        - 备用账号先调用 usage 余额接口探测，成功后直接加入活跃池。
         - 默认不自动发送 OTP、不自动注册，避免几百账号集中触发邮箱风控。
         - 如显式开启 AUTO_OTP_REFRESH / AUTO_REGISTER_ON_REPLENISH，
           仍会受到全局 OTP 限流与熔断保护。
@@ -274,7 +274,7 @@ class CookieManager:
             for acc in candidates:
                 if need - len(activated) <= 0:
                     break
-                log.info(f"👋 备用账号先执行 hello 探活: {acc.email}")
+                log.info(f"👋 备用账号先执行 usage 余额探测: {acc.email}")
                 ok = await self.check_session(acc, save=False)
                 if (
                         not ok
@@ -282,7 +282,7 @@ class CookieManager:
                         and otp_refreshes < AUTO_OTP_REFRESH_MAX_PER_TICK
                 ):
                     otp_refreshes += 1
-                    log.warning(f"🔑 hello 探活失败，受控 OTP 刷新: {acc.email}")
+                    log.warning(f"🔑 usage 余额探测失败，受控 OTP 刷新: {acc.email}")
                     ok = await self.refresh_account(acc)
                 if ok:
                     acc.fail_count = 0
@@ -716,7 +716,7 @@ class CookieManager:
         self.save()
         log.info(f"📈 [{acc.email}] 已用: {acc.usage_count}/{ACCOUNT_MAX_USAGE}")
 
-    # ── 账号 session 检查（LLM 探活） ────────────────────
+    # ── 账号 session 检查（usage 余额探测） ─────────────
     async def check_session(self, acc: AccountState, save: bool = True) -> bool:
         """
         通过发起一次轻量 LLM 对话来判断 session 是否仍然有效。
@@ -743,7 +743,7 @@ class CookieManager:
             if save:
                 self.save()
             return alive
-            probe_text = os.environ.get("KEEPALIVE_MESSAGE", "hello")
+            # 保留旧代码路径的默认值，但实际探活仅调用 usage 接口。
             chunks = []
             async for chunk in stream_cosverse_response(
                     text=probe_text,
