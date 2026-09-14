@@ -22,6 +22,7 @@ MODEL_MAP: dict[str, str] = {
     "sonar":           "Professor.Lai",
     # Meta
     "meta-llama/llama-4-scout-17b-16e-instruct":           "meta",
+    "gpt-5.4-mini-2": "Prof.Lai"
     # xAI
 }
 
