@@ -65,7 +65,7 @@ async def get_all_tokens_detail():
 @router.post("/tokens/refresh")
 async def tokens_refresh_all(background_tasks: BackgroundTasks):
     background_tasks.add_task(cm.keepalive_tick)
-    return {"message": "活跃池 hello 探活已启动，不会扫描全量账号或自动发送 OTP"}
+    return {"message": "活跃池 usage 余额探测已启动，不会扫描全量账号或自动发送 OTP"}
 
 
 @router.post("/tokens/{idx}/refresh")
@@ -75,7 +75,7 @@ async def token_refresh_one(idx: int):
         raise HTTPException(404, "账号不存在")
     alive = await cm.check_session(acc)
     return {
-        "message": "hello 探活完成",
+        "message": "usage 余额探测完成",
         "alive": alive,
         "token": _account_view(acc),
     }
@@ -99,7 +99,7 @@ async def tokens_bulk_refresh(req: Request, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(_task)
     return {
-        "message": f"已启动 {len(selected)} 个账号的 hello 探活",
+        "message": f"已启动 {len(selected)} 个账号的 usage 余额探测",
         "count": len(selected),
     }
 

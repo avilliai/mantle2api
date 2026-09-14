@@ -90,6 +90,7 @@ class ActionConfig:
     otp_action:    str = ""
     name_action:   str = ""
     title_action:  str = ""   # POST / 生成 chatTitle 的 Server Action
+    usage_action:  str = ""   # POST /usage Server Action
     deployment_id: str = ""
     router_state:  str = ""   # 登录页专用
     _fetched:      bool = False
@@ -112,6 +113,20 @@ class ActionConfig:
         ]
         return urllib.parse.quote(json.dumps(state, separators=(",", ":")))
 
+    def router_state_usage(self) -> str:
+        state = [
+            "",
+            {
+                "children": [
+                    ["params", "usage", "oc", None],
+                    {"children": ["__PAGE__", {}, None, None, 0]},
+                    None, None, 0
+                ]
+            },
+            None, None, 16
+        ]
+        return urllib.parse.quote(json.dumps(state, separators=(",", ":")))
+
 
 _cfg = ActionConfig()
 
@@ -121,6 +136,7 @@ _FALLBACK = {
     "otp_action":    "60fed0a1f5054c7d3703e93c55d809572b1250294e",
     "name_action":   "60a1d081ceb644ee662d33f415e23e034abdc32003",
     "title_action":  "40713336e55ac49e65d2159f352078f241da2e893a",  # 从抓包提取
+    "usage_action":  "00f6fa84f07135389a18c99f948df07127c5ce6476",  # 从抓包提取 /usage ?? action
     "deployment_id": "dpl_AVKvTSHzb232JfJr7qS6m9dNE7bp",
     "router_state":  (
         "%5B%22%22%2C%7B%22children%22%3A%5B%22auth%22%2C%7B%22children%22%3A"
@@ -187,6 +203,7 @@ async def fetch_action_config(force: bool = False) -> ActionConfig:
             _cfg.otp_action    = named_actions.get("verifyOTP", _FALLBACK["otp_action"])
             _cfg.name_action   = named_actions.get("addUserName", _FALLBACK["name_action"])
             _cfg.title_action  = _pick(_FALLBACK["title_action"],  _FALLBACK["title_action"])
+            _cfg.usage_action  = _pick(_FALLBACK["usage_action"],  _FALLBACK["usage_action"])
             _cfg.deployment_id = dep_id  or _FALLBACK["deployment_id"]
             _cfg.router_state  = router  or _FALLBACK["router_state"]
             _cfg._fetched      = True
@@ -197,6 +214,7 @@ async def fetch_action_config(force: bool = False) -> ActionConfig:
                 f"  otp   : {_cfg.otp_action}\n"
                 f"  name  : {_cfg.name_action}\n"
                 f"  title : {_cfg.title_action}\n"
+                f"  usage : {_cfg.usage_action}\n"
                 f"  dep_id: {_cfg.deployment_id}"
             )
 
@@ -206,6 +224,7 @@ async def fetch_action_config(force: bool = False) -> ActionConfig:
         _cfg.otp_action    = _FALLBACK["otp_action"]
         _cfg.name_action   = _FALLBACK["name_action"]
         _cfg.title_action  = _FALLBACK["title_action"]
+        _cfg.usage_action  = _FALLBACK["usage_action"]
         _cfg.deployment_id = _FALLBACK["deployment_id"]
         _cfg.router_state  = _FALLBACK["router_state"]
         _cfg._fetched      = True

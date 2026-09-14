@@ -1,6 +1,7 @@
-# app/models.py
+﻿# app/models.py
 
-ACCOUNT_QUOTA = 100  # 每个账号永久限额 100 次，上游不会重置
+ACCOUNT_QUOTA = 100  # 默认 100 次，根据 /usage 实时同步
+
 
 class AccountState:
     def __init__(self, d: dict, index: int = 1):
@@ -12,25 +13,45 @@ class AccountState:
         self.disabled = d.get("disabled", False)
         self.healthy = d.get("healthy", True)
         self.usage_count = d.get("usage_count", 0)
+        self.message_limit = d.get("message_limit", ACCOUNT_QUOTA)
+        self.message_usage = d.get("message_usage", self.usage_count)
+        self.quota_exhausted_flag = d.get("quota_exhausted", False)
+        self.fail_count = 0
 
     @property
     def remaining(self) -> int:
         """剩余额度"""
-        return max(0, ACCOUNT_QUOTA - self.usage_count)
+        limit = self.message_limit if self.message_limit > 0 else ACCOUNT_QUOTA
+        return max(0, limit - self.message_usage)
 
     @property
     def is_alive(self) -> bool:
-        """账号是否存活（健康、未禁用、额度未耗尽）"""
-        return self.healthy and not self.disabled and self.remaining > 0
+        """账号当前是否可用（健康、未禁用、且配额未耗尽）"""
+        return self.healthy and not self.disabled and not self.quota_exhausted
 
     @property
     def quota_exhausted(self) -> bool:
-        """额度是否耗尽"""
-        return self.usage_count >= ACCOUNT_QUOTA
+        """配额是否已耗尽"""
+        if self.quota_exhausted_flag:
+            return True
+        limit = self.message_limit if self.message_limit > 0 else ACCOUNT_QUOTA
+        return self.message_usage >= limit
+
+    def mark_quota_exhausted(self) -> None:
+        """标记配额耗尽并设为不可用，保留在账号列表中不删除"""
+        self.quota_exhausted_flag = True
+        self.disabled = True
+
+    def mark_quota_recovered(self) -> None:
+        """配额重置后重新启用"""
+        self.quota_exhausted_flag = False
+        self.disabled = False
+        self.healthy = True
+        self.fail_count = 0
 
     @property
     def token_hint(self) -> str:
-        """提取并脱敏 session-token，供前端 Token 列展示"""
+        """从 cookie 中截取 session-token，作为 Token 摘要"""
         if not self.cookie_str:
             return "N/A"
         for part in self.cookie_str.split(";"):
@@ -43,7 +64,7 @@ class AccountState:
         return "N/A"
 
     def cookies_dict(self) -> dict:
-        """将 cookie 字符串转换为 dict 格式"""
+        """将 cookie 字符串解析为 dict 格式"""
         if not self.cookie_str:
             return {}
         res = {}
@@ -54,12 +75,6 @@ class AccountState:
                 res[k.strip()] = v.strip()
         return res
 
-    def increment_usage(self) -> None:
-        """递增用量；达到上限后由 CookieManager 永久删除账号"""
-        self.usage_count += 1
-        if self.quota_exhausted:
-            self.disabled = True
-
     def to_dict(self) -> dict:
         return {
             "email": self.email,
@@ -69,4 +84,7 @@ class AccountState:
             "disabled": self.disabled,
             "healthy": self.healthy,
             "usage_count": self.usage_count,
+            "message_limit": self.message_limit,
+            "message_usage": self.message_usage,
+            "quota_exhausted": self.quota_exhausted_flag,
         }

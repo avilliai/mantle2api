@@ -13,6 +13,7 @@ from fastapi import HTTPException
 
 from app.config import TOKENS_FILE
 from app.models import AccountState
+from app.usage_client import fetch_usage
 
 log = logging.getLogger("cosverse_proxy.cookie_manager")
 
@@ -24,8 +25,8 @@ dotenv.load_dotenv()
 # 改为只维护一个小的"活跃池"，仅对池内账号做探活/保活；
 # 池内账号配额耗尽或连续失败达到阈值时被请出池子，
 # 再从备用账号（健康但不在池内）或新注册账号中补充。
-ACTIVE_POOL_SIZE = int(os.environ.get("ACTIVE_POOL_SIZE", "10"))
-REPLENISH_BATCH = int(os.environ.get("REPLENISH_BATCH", "6"))
+ACTIVE_POOL_SIZE = int(os.environ.get("ACTIVE_POOL_SIZE", "11"))
+REPLENISH_BATCH = int(os.environ.get("REPLENISH_BATCH", "8"))
 FAIL_THRESHOLD = int(os.environ.get("ACCOUNT_FAIL_THRESHOLD", "3"))
 REPLENISH_PROBE_LIMIT = int(os.environ.get("REPLENISH_PROBE_LIMIT", "20"))
 AUTO_OTP_REFRESH = os.environ.get("AUTO_OTP_REFRESH", "false").lower() in ("1", "true", "yes")
@@ -65,9 +66,6 @@ class CookieManager:
                 accounts = []
                 for i, d in enumerate(data):
                     if not d.get("cookie_str"):
-                        continue
-                    if int(d.get("usage_count", 0) or 0) >= ACCOUNT_MAX_USAGE:
-                        purged_exhausted.append(d.get("email", f"index-{i + 1}"))
                         continue
                     acc = AccountState(d, i + 1)
                     # 恢复 email_jwt（保活时收 OTP 必须）
@@ -155,7 +153,7 @@ class CookieManager:
         with self._sync_lock:
             pool_set = set(self.active_pool)
             for acc in self.accounts:
-                remaining = max(0, ACCOUNT_MAX_USAGE - acc.usage_count)
+                remaining = acc.remaining
                 total_remaining += remaining
 
                 if acc.healthy and not acc.disabled and remaining > 0:
@@ -187,19 +185,6 @@ class CookieManager:
 
     # ── 账号增删 ──────────────────────────────────────────
     def add_account(self, data: dict) -> bool:
-        if int(data.get("usage_count", 0) or 0) >= ACCOUNT_MAX_USAGE:
-            email = data.get("email", "")
-            with self._sync_lock:
-                removed_indexes = {
-                    acc.index for acc in self.accounts if acc.email == email
-                }
-                self.accounts = [acc for acc in self.accounts if acc.email != email]
-                self.active_pool = [
-                    idx for idx in self.active_pool if idx not in removed_indexes
-                ]
-            log.warning(f"忽略并清理已耗尽账号: {email or '<unknown>'}")
-            return False
-
         with self._sync_lock:
             for acc in self.accounts:
                 if acc.email == data.get("email"):
@@ -226,7 +211,7 @@ class CookieManager:
             return False
         if not acc.healthy or acc.disabled:
             return False
-        if acc.usage_count >= ACCOUNT_MAX_USAGE:
+        if acc.quota_exhausted:
             return False
         if getattr(acc, "fail_count", 0) >= FAIL_THRESHOLD:
             return False
@@ -381,7 +366,7 @@ class CookieManager:
         # 统计未耗尽可用额度的账号数量（包括活跃池 + 备用池）
         valid_count = sum(
             1 for a in self.accounts
-            if a.usage_count < ACCOUNT_MAX_USAGE
+            if not a.quota_exhausted
         )
 
         if valid_count < target_count:
@@ -396,7 +381,7 @@ class CookieManager:
                 # 每次循环重新统计，防并发淘汰导致的数据变更
                 valid_count = sum(
                     1 for a in self.accounts
-                    if a.usage_count < ACCOUNT_MAX_USAGE
+                    if not a.quota_exhausted
                 )
 
                 need = target_count - valid_count
@@ -409,7 +394,8 @@ class CookieManager:
 
                 if not new_acc:
                     log.warning("⚠️ 后台注册失败，暂时中止循环，留待下次探活时重试以避免风控")
-                    break
+                    continue
+                    #break
 
                 # 平滑过渡策略：如果还需要继续注册，随机休眠 15~30 秒，避免高频请求被封 IP
                 if need > 1:
@@ -482,7 +468,7 @@ class CookieManager:
 
         with self._sync_lock:
             pool_set = set(self.active_pool)
-            candidates = [a for a in self.accounts if a.index in pool_set]
+            candidates = [a for a in self.accounts if a.index in pool_set or a.quota_exhausted]
 
         if not candidates:
             log.info("⏰ 活跃池为空，跳过探活，尝试补充。")
@@ -602,7 +588,9 @@ class CookieManager:
           失败则彻底放弃该账号，改用活跃池中的其他账号或新账号。
         """
         if reason == "quota_exhausted":
-            self._discard_account(acc, reason)
+            acc.mark_quota_exhausted()
+            self.save()
+            asyncio.create_task(self._evict_from_pool(acc, reason))
             await self._replenish_active_pool()
             with self._sync_lock:
                 pool_set = set(self.active_pool)
@@ -711,12 +699,11 @@ class CookieManager:
         # 一次成功的请求记账，说明账号当前可用，清零连续失败计数
         acc.fail_count = 0
 
-        quota_exhausted = acc.usage_count >= ACCOUNT_MAX_USAGE
+        quota_exhausted = acc.quota_exhausted
         if quota_exhausted:
-            removed = self._discard_account(
-                acc, f"usage_count_reached_{ACCOUNT_MAX_USAGE}"
-            )
-            if removed:
+            acc.mark_quota_exhausted()
+            self.save()
+            if True:
                 try:
                     loop = asyncio.get_running_loop()
                     loop.create_task(self._replenish_active_pool())
@@ -741,9 +728,22 @@ class CookieManager:
         from app.cosverse_client import stream_cosverse_response, EmptyResponseError
         from app.routers.model_list import resolve_model
         try:
+            alive, limits, error = await fetch_usage(acc.cookie_str)
+            if alive:
+                acc.healthy = True
+                acc.message_limit = int(limits.get("messageLimit", acc.message_limit) or 0)
+                acc.message_usage = int(limits.get("messageUsage", acc.message_usage) or 0)
+                acc.usage_count = acc.message_usage
+                if acc.message_usage < acc.message_limit:
+                    acc.mark_quota_recovered()
+                else:
+                    acc.mark_quota_exhausted()
+            else:
+                acc.healthy = False
+            if save:
+                self.save()
+            return alive
             probe_text = os.environ.get("KEEPALIVE_MESSAGE", "hello")
-            probe_model = os.environ.get("KEEPALIVE_MODEL", "gemini-3-flash-preview")
-            model_id, provider = resolve_model(probe_model)
             chunks = []
             async for chunk in stream_cosverse_response(
                     text=probe_text,
