@@ -25,6 +25,7 @@ from app.cookie_manager import cm
 from app.mantle_client import (
     messages_to_text,
     stream_mantle_response,
+    upload_url_to_mantle,
     EmptyResponseError,
     ServerError,
 )
@@ -73,6 +74,54 @@ def _convert_messages(messages: list[dict]) -> list[dict]:
     return converted
 
 
+def _extract_and_filter_images(
+    messages: list[dict],
+) -> tuple[list[dict], list[str]]:
+    """
+    遍历 messages，提取图片/附件 URL 用于上传至 Mantle。
+    倒序扫描，只保留最近 3 次 user 消息中的图片/附件；
+    更早的历史附件替换为占位文本。
+
+    返回：(清理后的纯文本 messages, 需要上传的 image_url 列表)
+    """
+    resolved_messages: list[dict] = []
+    images_to_upload: list[str] = []
+    user_turn_count = 0
+
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            user_turn_count += 1
+
+        content = msg.get("content")
+
+        if not isinstance(content, list):
+            resolved_messages.insert(0, msg)
+            continue
+
+        text_parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif block.get("type") == "image_url":
+                url = block.get("image_url", {}).get("url", "")
+                if user_turn_count <= 3:
+                    if url:
+                        images_to_upload.append(url)
+                    text_parts.append("[附带附件/图片]")
+                else:
+                    text_parts.append("[历史附件/图片已被系统省略]")
+
+        resolved_messages.insert(0, {
+            **msg,
+            "content": "\n\n".join(filter(None, text_parts)),
+        })
+
+    images_to_upload.reverse()
+    return resolved_messages, images_to_upload
+
+
 # ── Function Calling 工具注入与解析 ──────────────────────────
 
 def _annotate_tool_declarations(tools: list[dict]) -> list[dict]:
@@ -106,10 +155,10 @@ def _validate_tool_call(tc: dict, tool_declarations: list[dict]) -> tuple[bool, 
         required = params.get("required", [])
         missing = [r for r in required if r not in args or args[r] in (None, "", {}, [])]
         if missing:
-            log.warning("tool call [%s] ??????: %s", name, missing)
+            log.warning("tool call [%s] 缺少必填参数: %s", name, missing)
             return False, missing
         return True, []
-    log.warning("tool call [%s] ??????????????", name)
+    log.warning("tool call [%s] 不在工具声明列表中，跳过校验", name)
     return True, []
 
 
@@ -292,6 +341,7 @@ async def chat_completions(request: Request):
 
     real_model, _ = resolve_model(raw_model)
     clean_messages = _convert_messages(raw_messages)
+    base_messages, raw_image_urls = _extract_and_filter_images(clean_messages)
 
     req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created_time = int(time.time())
@@ -307,10 +357,23 @@ async def chat_completions(request: Request):
                 attempt += 1
                 try:
                     account = await cm.get_account()
+                    chat_id = str(uuid.uuid4())
+
+                    # 上传图片/附件至 Mantle
+                    attachments = []
+                    if raw_image_urls:
+                        upload_tasks = [upload_url_to_mantle(u, account, chat_id) for u in raw_image_urls]
+                        upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+                        attachments = [r for r in upload_results if isinstance(r, str) and r]
+                        if len(attachments) < len(raw_image_urls):
+                            log.warning(
+                                "[%s] %d/%d 个附件上传失败",
+                                account.email, len(raw_image_urls) - len(attachments), len(raw_image_urls),
+                            )
 
                     # 若开启 tools，当请求包含工具调用系统时，为了完整捕获并格式化返回 tool_calls，做缓冲/解析
-                    # 或者常规流式正常直出
-                    attempt_messages = list(clean_messages)
+                    # 纯对话标准实时流式直出
+                    attempt_messages = list(base_messages)
                     if has_tools and current_tools:
                         tool_sys = _build_tool_system_prompt(current_tools)
                         insert_pos = next(
@@ -319,13 +382,12 @@ async def chat_completions(request: Request):
                         attempt_messages.insert(insert_pos, {"role": "system", "content": tool_sys})
 
                     prompt = messages_to_text(attempt_messages)
-                    chat_id = str(uuid.uuid4())
 
                     if has_tools:
                         # 收集流式输出进行 tool_calls 探测
                         collected_text = []
                         last_usage = None
-                        async for chunk in stream_mantle_response(account, real_model, prompt, chat_id):
+                        async for chunk in stream_mantle_response(account, real_model, prompt, chat_id, attachments):
                             if "delta" in chunk:
                                 collected_text.append(chunk["delta"])
                             if "usage" in chunk and chunk["usage"]:
@@ -344,7 +406,7 @@ async def chat_completions(request: Request):
 
                         clean_text, tool_calls = _parse_tool_calls(full_text)
 
-                        # ??????
+                        # 校验必填参数
                         if tool_calls:
                             invalid = []
                             for tc in tool_calls:
@@ -353,10 +415,10 @@ async def chat_completions(request: Request):
                                     invalid.append((tc["name"], missing))
                             if invalid:
                                 if attempt < MAX_RETRIES:
-                                    log.warning("stream(tools) attempt %d ?????? %s???", attempt, invalid)
+                                    log.warning("stream(tools) attempt %d 参数不完整 %s，重试...", attempt, invalid)
                                     continue
                                 else:
-                                    log.error("stream(tools) ?????? %s????????????", invalid)
+                                    log.error("stream(tools) 参数不完整 %s，达到最大重试次数，仍返回", invalid)
 
                         if tool_calls:
                             sse_chunks = _make_tool_call_sse(tool_calls, clean_text, raw_model, req_id, created_time)
@@ -401,7 +463,7 @@ async def chat_completions(request: Request):
                         # 纯对话标准实时流式直出
                         first_chunk = True
                         has_yielded = False
-                        async for chunk in stream_mantle_response(account, real_model, prompt, chat_id):
+                        async for chunk in stream_mantle_response(account, real_model, prompt, chat_id, attachments):
                             if first_chunk:
                                 header_data = {
                                     "id": req_id,
@@ -474,8 +536,21 @@ async def chat_completions(request: Request):
         account = None
         try:
             account = await cm.get_account()
+            chat_id = str(uuid.uuid4())
 
-            attempt_messages = list(clean_messages)
+            # 上传图片/附件至 Mantle
+            attachments = []
+            if raw_image_urls:
+                upload_tasks = [upload_url_to_mantle(u, account, chat_id) for u in raw_image_urls]
+                upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+                attachments = [r for r in upload_results if isinstance(r, str) and r]
+                if len(attachments) < len(raw_image_urls):
+                    log.warning(
+                        "[%s] %d/%d 个附件上传失败",
+                        account.email, len(raw_image_urls) - len(attachments), len(raw_image_urls),
+                    )
+
+            attempt_messages = list(base_messages)
             if has_tools and current_tools:
                 tool_sys = _build_tool_system_prompt(current_tools)
                 insert_pos = next(
@@ -484,13 +559,12 @@ async def chat_completions(request: Request):
                 attempt_messages.insert(insert_pos, {"role": "system", "content": tool_sys})
 
             prompt = messages_to_text(attempt_messages)
-            chat_id = str(uuid.uuid4())
 
             collected_text = []
             finish_reason = "stop"
             usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-            async for chunk in stream_mantle_response(account, real_model, prompt, chat_id):
+            async for chunk in stream_mantle_response(account, real_model, prompt, chat_id, attachments):
                 if "delta" in chunk:
                     collected_text.append(chunk["delta"])
                 if "finish_reason" in chunk:
@@ -512,7 +586,7 @@ async def chat_completions(request: Request):
 
                 clean_text, tool_calls = _parse_tool_calls(full_content)
 
-                # ??????
+                # 校验必填参数
                 if tool_calls:
                     invalid = []
                     for tc in tool_calls:
@@ -521,10 +595,10 @@ async def chat_completions(request: Request):
                             invalid.append((tc["name"], missing))
                     if invalid:
                         if attempt < MAX_RETRIES:
-                            log.warning("non-stream(tools) attempt %d ?????? %s???", attempt, invalid)
+                            log.warning("non-stream(tools) attempt %d 参数不完整 %s，重试...", attempt, invalid)
                             continue
                         else:
-                            log.error("non-stream(tools) ?????? %s????????????", invalid)
+                            log.error("non-stream(tools) 参数不完整 %s，达到最大重试次数，仍返回", invalid)
 
                 if tool_calls:
                     await cm.report_success(account)

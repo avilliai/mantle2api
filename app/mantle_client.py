@@ -250,15 +250,148 @@ class MantleRegister:
             return None
 
 
+async def upload_file_to_mantle(
+    file_bytes: bytes,
+    filename: str,
+    mime_type: str,
+    account: AccountState,
+    chat_id: Optional[str] = None,
+) -> Optional[str]:
+    """
+    ????/??? Mantle ? R2 ???????? attachmentId?
+    """
+    ws = account.workspace_id
+    if not ws:
+        log.error(f"[{account.email}] ?? workspace_id???????")
+        return None
+
+    if not mime_type:
+        mime_type = "application/octet-stream"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": MANTLE_WEB,
+        "Referer": f"{MANTLE_WEB}/w/{ws}/chat",
+        "x-csrf-token": account.csrf_token,
+    }
+
+    req_body = {
+        "workspaceId": ws,
+        "purpose": "chat",
+        "filename": filename,
+        "mimeType": mime_type,
+        "sizeBytes": len(file_bytes),
+        "supportsConditionalPut": True,
+    }
+    if chat_id:
+        req_body["chatId"] = chat_id
+
+    try:
+        async with AsyncSession(proxy=HTTP_PROXY or None, impersonate=IMPERSONATE) as session:
+            for k, v in account.cookies.items():
+                session.cookies.set(k, v, domain="mantle.chat")
+
+            # 1. ?????????
+            r = await session.post(
+                f"{MANTLE_API}/attachments/upload-url",
+                json=req_body,
+                headers=headers,
+                timeout=30,
+            )
+            if r.status_code != 200:
+                log.error(f"[{account.email}] ?????????? ({r.status_code}): {r.text}")
+                return None
+
+            res_data = r.json()
+            attachment_id = res_data.get("attachmentId")
+            upload_url = res_data.get("uploadUrl")
+            if not attachment_id or not upload_url:
+                log.error(f"[{account.email}] ?????????: {res_data}")
+                return None
+
+            # 2. PUT ????? Cloudflare R2
+            put_headers = {
+                "Content-Type": mime_type,
+                "If-None-Match": "*",
+            }
+            r_put = await session.put(upload_url, data=file_bytes, headers=put_headers, timeout=60)
+            if r_put.status_code not in (200, 201, 204):
+                log.error(f"[{account.email}] ??? R2 ?? ({r_put.status_code}): {r_put.text}")
+                return None
+
+            # 3. ????
+            r_act = await session.post(
+                f"{MANTLE_API}/attachments/{attachment_id}/activate",
+                json={},
+                headers=headers,
+                timeout=30,
+            )
+            if r_act.status_code != 200:
+                log.error(f"[{account.email}] ?????? ({r_act.status_code}): {r_act.text}")
+                return None
+
+            log.info(f"[{account.email}] ?????????: {attachment_id} ({filename})")
+            return attachment_id
+    except Exception as e:
+        log.error(f"[{account.email}] ??????: {e}", exc_info=True)
+        return None
+
+
+async def upload_url_to_mantle(
+    url: str,
+    account: AccountState,
+    chat_id: Optional[str] = None,
+) -> Optional[str]:
+    """
+    ? data URI ? http/https URL ??/???????? Mantle??? attachmentId?
+    """
+    import base64
+    import mimetypes
+
+    try:
+        # ?? data URI (base64)
+        data_uri_match = re.match(
+            r"data:(?P<mime>[^;,]+)(?:;base64)?,(?P<data>.+)", url, re.DOTALL
+        )
+        if data_uri_match:
+            mime = data_uri_match.group("mime").strip()
+            raw_data = base64.b64decode(data_uri_match.group("data").strip())
+            ext = mimetypes.guess_extension(mime) or ""
+            filename = f"upload{ext or '.bin'}"
+            return await upload_file_to_mantle(raw_data, filename, mime, account, chat_id)
+
+        # ?? URL ??
+        async with AsyncSession(proxy=HTTP_PROXY or None, impersonate=IMPERSONATE, timeout=30) as session:
+            resp = await session.get(url, timeout=30)
+            if resp.status_code != 200:
+                log.warning(f"??????: {url} -> HTTP {resp.status_code}")
+                return None
+            raw_data = resp.content
+            mime = resp.headers.get("content-type", "").split(";")[0].strip() or "application/octet-stream"
+            ext = mimetypes.guess_extension(mime) or ""
+            path_part = url.split("?")[0].rstrip("/").split("/")[-1]
+            filename = path_part if "." in path_part else f"download{ext or '.bin'}"
+            return await upload_file_to_mantle(raw_data, filename, mime, account, chat_id)
+    except Exception as e:
+        log.error(f"upload_url_to_mantle ??: {url[:80]} - {e}")
+        return None
+
+
 async def stream_mantle_response(
     account: AccountState,
     model: str,
     prompt: str,
     chat_id: Optional[str] = None,
+    attachments: Optional[list[str]] = None,
 ) -> AsyncIterator[dict]:
     """
     ?? Mantle /api/chat/create-stream ??? SSE /api/chat/stream/{streamId}
-    yield SSE delta ????? OpenAI ????
+    yield SSE delta ???? OpenAI ??????
     """
     ws = account.workspace_id
     if not ws:
@@ -293,6 +426,9 @@ async def stream_mantle_response(
         "autoSave": True,
         "isTemporaryChat": False,
     }
+
+    if attachments:
+        payload["attachments"] = attachments
 
     async with AsyncSession(proxy=HTTP_PROXY or None, impersonate=IMPERSONATE) as session:
         for k, v in cookies.items():
@@ -355,4 +491,4 @@ async def stream_mantle_response(
                     continue
 
         if not has_content:
-            raise EmptyResponseError("????????? delta")
+            raise EmptyResponseError("????????? delta ??")
