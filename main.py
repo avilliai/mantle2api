@@ -48,13 +48,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
 async def lifespan(app: FastAPI):
     cm.load()
     logging.getLogger("mantle_proxy").info(
-        f"代理服务启动，已加载 {len(cm.accounts)} 个 Mantle 账号"
+        f"?????????? {len(cm.accounts)} ? Mantle ?????????? {len(cm.active_pool)} ???"
     )
 
-    # 启动时异步同步所有已启用账号的真实月度配额与保活状态
-    for acc in cm.accounts:
-        if not acc.disabled:
-            asyncio.create_task(cm.check_session(acc))
+    # ???????????????????????????????????????
+    asyncio.create_task(cm._replenish_active_pool())
 
     yield
 
@@ -95,7 +93,12 @@ async def serve_dashboard():
 @app.get("/health")
 async def health():
     eligible = sum(1 for a in cm.accounts if cm._account_is_eligible(a))
-    return {"status": "ok", "total_accounts": len(cm.accounts), "available_accounts": eligible}
+    return {
+        "status": "ok",
+        "total_accounts": len(cm.accounts),
+        "available_accounts": eligible,
+        "active_pool_size": len(cm.active_pool),
+    }
 
 
 if __name__ == "__main__":

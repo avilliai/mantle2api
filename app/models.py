@@ -1,6 +1,8 @@
 # app/models.py
 
-ACCOUNT_QUOTA = 1500  # Mantle 默认月度配额 1500，根据 usage-status 实时同步
+from datetime import datetime, timezone
+
+ACCOUNT_QUOTA = 1500  # Mantle ?????? 1500??? usage-status ????
 
 
 class AccountState:
@@ -31,28 +33,44 @@ class AccountState:
 
     @property
     def remaining(self) -> int:
-        """剩余额度"""
+        """????"""
         limit = self.message_limit if self.message_limit > 0 else ACCOUNT_QUOTA
         return max(0, limit - self.message_usage)
 
     @property
     def is_alive(self) -> bool:
-        """账号当前是否可用（健康、未禁用、且配额未耗尽）"""
+        """???????????????????????"""
         return self.healthy and not self.disabled and not self.quota_exhausted
 
     @property
     def quota_exhausted(self) -> bool:
-        """配额是否已耗尽"""
+        """???????"""
         if self.quota_exhausted_flag:
             return True
         limit = self.message_limit if self.message_limit > 0 else ACCOUNT_QUOTA
         return self.message_usage >= limit
 
-    def mark_quota_exhausted(self) -> None:
+    def is_reset_due(self) -> bool:
+        """?????????????????????????"""
+        if not self.resets_at:
+            return False
+        try:
+            clean_str = self.resets_at.replace("Z", "+00:00")
+            reset_time = datetime.fromisoformat(clean_str)
+            now = datetime.now(timezone.utc)
+            return now >= reset_time
+        except Exception:
+            return False
+
+    def mark_quota_exhausted(self, resets_at: str = None) -> None:
+        """????????????"""
         self.quota_exhausted_flag = True
         self.disabled = True
+        if resets_at:
+            self.resets_at = resets_at
 
     def mark_quota_recovered(self) -> None:
+        """???????????"""
         self.quota_exhausted_flag = False
         self.disabled = False
         self.healthy = True
@@ -60,14 +78,14 @@ class AccountState:
 
     @property
     def token_hint(self) -> str:
-        """从 cookie 中截取 wos-session 作为 Token 摘要"""
+        """? cookie ??? wos-session ?? Token ??"""
         session = self.cookies.get("wos-session") or ""
         if session and len(session) > 20:
             return f"{session[:10]}...{session[-10:]}"
         return self.email or "N/A"
 
     def cookies_dict(self) -> dict:
-        """将 cookie 字符串解析为 dict 格式"""
+        """? cookie ?????? dict ??"""
         if self.cookies:
             return dict(self.cookies)
         if not self.cookie_str:
