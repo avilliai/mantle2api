@@ -3,11 +3,10 @@
 """
 对话接口路由：
   POST /v1/chat/completions   OpenAI 兼容（流式 / 非流式）
-
 功能：
-  - 图片/文件上传（Cosverse R2）
-  - Function Calling 伪实现（@@TOOL_CALL_BEGIN@@ 标记）
-  - 配额耗尽 / cookie 过期自动换号重试
+  - Function Calling 伪实现（@@TOOL_CALL_BEGIN@@ 标记注入与解析）
+  - 流式 SSE 与非流式统一适配
+  - 账号失败重试与健康度反馈
 """
 import asyncio
 import copy
@@ -16,7 +15,6 @@ import logging
 import random
 import re
 import time
-import traceback
 import uuid
 from typing import Any, Optional
 
@@ -24,29 +22,28 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.cookie_manager import cm
-from app.cosverse_client import (
+from app.mantle_client import (
     messages_to_text,
-    stream_cosverse_response,
-    upload_url_to_cosverse,
-    _build_attachment_list,
+    stream_mantle_response,
+    EmptyResponseError,
+    ServerError,
 )
 from app.models import AccountState
 from app.routers.model_list import resolve_model, DEFAULT_MODEL
 
-log = logging.getLogger("cosverse_proxy.chat")
+log = logging.getLogger("mantle_proxy.chat")
 
 router = APIRouter()
 
-# 将最大重试次数改为 4：以便在第 3 次失败并强制注册新号后，能有第 4 次机会使用新号完成当前请求
-MAX_RETRIES     = 4
-RETRY_DELAY     = 1.0
+MAX_RETRIES = 3
+RETRY_DELAY = 1.0
 RETRY_DELAY_MAX = 3.0
 
 # ══════════════════════════════════════════════════════════
 # 工具调用（Function Calling）伪实现
 # ══════════════════════════════════════════════════════════
-_TC_BEGIN   = "@@TOOL_CALL_BEGIN@@"
-_TC_END     = "@@TOOL_CALL_END@@"
+_TC_BEGIN = "@@TOOL_CALL_BEGIN@@"
+_TC_END = "@@TOOL_CALL_END@@"
 _TC_PATTERN = re.compile(
     rf"{re.escape(_TC_BEGIN)}\s*(.*?)\s*{re.escape(_TC_END)}",
     re.DOTALL,
@@ -58,88 +55,34 @@ def _backoff(attempt: int) -> float:
     return delay + random.uniform(0, delay * 0.1)
 
 
-# ── 消息预处理 ────────────────────────────────────────────
-
 def _convert_messages(messages: list[dict]) -> list[dict]:
-    """
-    标准化 messages：
-    - tool 角色 → user（带工具返回标注）
-    - 保留 list 类型 content（后续图片过滤会处理）
-    """
-    result = []
+    """标准化消息，保证结构安全"""
+    converted = []
     for msg in messages:
-        role    = msg.get("role", "user")
+        role = msg.get("role", "user")
         content = msg.get("content", "")
-        name    = msg.get("name", "")
+        # 如果是 tool 响应角色，转化为 user 身份供模型阅读
         if role == "tool":
-            text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-            result.append({
-                "role":    "user",
-                "content": f"[工具 {name} 返回结果]\n{text}\n请基于这个结果直接回复用户，不要再次调用工具。",
+            tool_call_id = msg.get("tool_call_id", "")
+            converted.append({
+                "role": "user",
+                "content": f"[Tool Result for {tool_call_id}]: {content}",
             })
         else:
-            result.append({"role": role, "content": content})
-    return result
+            converted.append({"role": role, "content": content})
+    return converted
 
 
-async def _extract_and_filter_images(
-    messages: list[dict],
-) -> tuple[list[dict], list[str]]:
-    """
-    遍历 messages，提取图片 URL 用于上传。
-    倒序扫描，只保留最近 3 次 user 消息中的图片（节省配额）；
-    更早的历史图片替换为占位文本。
-
-    返回：(清理后的纯文本 messages, 需要上传的 image_url 列表)
-    """
-    resolved_messages: list[dict] = []
-    images_to_upload:  list[str]  = []
-    user_turn_count = 0
-
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            user_turn_count += 1
-
-        content = msg.get("content")
-
-        if not isinstance(content, list):
-            resolved_messages.insert(0, msg)
-            continue
-
-        text_parts: list[str] = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-            elif block.get("type") == "image_url":
-                url = block.get("image_url", {}).get("url", "")
-                if user_turn_count <= 3:
-                    if url:
-                        images_to_upload.append(url)
-                    text_parts.append("[附带图片]")
-                else:
-                    text_parts.append("[历史图片已被系统省略]")
-
-        resolved_messages.insert(0, {
-            **msg,
-            "content": "\n\n".join(filter(None, text_parts)),
-        })
-
-    images_to_upload.reverse()
-    return resolved_messages, images_to_upload
-
-
-# ── Function Calling 工具 ─────────────────────────────────
+# ── Function Calling 工具注入与解析 ──────────────────────────
 
 def _annotate_tool_declarations(tools: list[dict]) -> list[dict]:
     """在工具参数 description 里注入【必填】/【可选】标签，提升模型遵从率"""
     annotated = copy.deepcopy(tools)
     for tool in annotated:
-        func         = tool if "parameters" in tool else tool.get("function", {})
-        params       = func.get("parameters", {})
+        func = tool if "parameters" in tool else tool.get("function", {})
+        params = func.get("parameters", {})
         required_set = set(params.get("required", []))
-        props        = params.get("properties", {})
+        props = params.get("properties", {})
         for param_name, param_def in props.items():
             tag = "【必填】" if param_name in required_set else "【可选】"
             existing = param_def.get("description", "")
@@ -155,18 +98,18 @@ def _validate_tool_call(tc: dict, tool_declarations: list[dict]) -> tuple[bool, 
     name = tc.get("name", "")
     args = tc.get("arguments", {})
     for tool in tool_declarations:
-        func      = tool if "parameters" in tool else tool.get("function", {})
+        func = tool if "parameters" in tool else tool.get("function", {})
         func_name = func.get("name", "")
         if func_name != name:
             continue
-        params  = func.get("parameters", {})
+        params = func.get("parameters", {})
         required = params.get("required", [])
-        missing  = [r for r in required if r not in args or args[r] in (None, "", {}, [])]
+        missing = [r for r in required if r not in args or args[r] in (None, "", {}, [])]
         if missing:
-            log.warning("tool call [%s] 缺少必填参数: %s", name, missing)
+            log.warning("tool call [%s] ??????: %s", name, missing)
             return False, missing
         return True, []
-    log.warning("tool call [%s] 未在工具列表中找到，跳过校验", name)
+    log.warning("tool call [%s] ??????????????", name)
     return True, []
 
 
@@ -225,9 +168,9 @@ def _parse_tool_calls(text: str) -> tuple[str, list[dict]]:
         raw = m.group(1).strip()
         try:
             obj = json.loads(raw)
-            tc  = {
-                "id":        f"call_{uuid.uuid4().hex[:12]}",
-                "name":      obj.get("name", ""),
+            tc = {
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "name": obj.get("name", ""),
                 "arguments": obj.get("arguments", {}),
             }
             tool_calls.append(tc)
@@ -243,14 +186,14 @@ def _check_truncation(
 ) -> tuple[bool, str, list[dict]]:
     """检测工具调用块是否被上游截断（有 BEGIN 但没有 END）"""
     begin_idx = full_text.find(_TC_BEGIN)
-    end_idx   = full_text.find(_TC_END)
+    end_idx = full_text.find(_TC_END)
     if begin_idx != -1 and end_idx == -1:
         fallback_text = full_text[:begin_idx].strip()
-        name_match    = re.search(r'"name"\s*:\s*"([^"]+)"', full_text[begin_idx:])
-        next_tools    = original_tools
+        name_match = re.search(r'"name"\s*:\s*"([^"]+)"', full_text[begin_idx:])
+        next_tools = original_tools
         if name_match:
             target_name = name_match.group(1)
-            filtered    = [
+            filtered = [
                 t for t in original_tools
                 if t.get("name") == target_name
                 or t.get("function", {}).get("name") == target_name
@@ -263,121 +206,68 @@ def _check_truncation(
 
 # ── 响应格式化 ────────────────────────────────────────────
 
-def _make_plain_response(text: str, model: str) -> dict:
-    return {
-        "id":      f"chatcmpl-{uuid.uuid4().hex[:24]}",
-        "object":  "chat.completion",
-        "created": int(time.time()),
-        "model":   model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-        "usage":   None,
-    }
-
-
-def _make_tool_call_response(tool_calls: list[dict], clean_text: str, model: str) -> dict:
+def _make_tool_call_response(tool_calls: list[dict], clean_text: str, model: str, usage: Optional[dict] = None) -> dict:
     openai_tool_calls = [
         {
-            "id":   tc["id"],
+            "id": tc["id"],
             "type": "function",
             "function": {
-                "name":      tc["name"],
+                "name": tc["name"],
                 "arguments": json.dumps(tc["arguments"], ensure_ascii=False),
             },
         }
         for tc in tool_calls
     ]
     message: dict[str, Any] = {
-        "role":       "assistant",
-        "content":    clean_text or None,
+        "role": "assistant",
+        "content": clean_text or None,
         "tool_calls": openai_tool_calls,
     }
     return {
-        "id":      f"chatcmpl-{uuid.uuid4().hex[:24]}",
-        "object":  "chat.completion",
+        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+        "object": "chat.completion",
         "created": int(time.time()),
-        "model":   model,
+        "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls"}],
-        "usage":   None,
+        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
 
 
-def _plain_text_to_sse(text: str, model: str) -> str:
-    now     = int(time.time())
-    resp_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-
-    def _sse(obj: dict) -> str:
-        return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
-
-    return "".join([
-        _sse({"id": resp_id, "object": "chat.completion.chunk", "created": now, "model": model,
-              "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}),
-        _sse({"id": resp_id, "object": "chat.completion.chunk", "created": now, "model": model,
-              "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}),
-        _sse({"id": resp_id, "object": "chat.completion.chunk", "created": now, "model": model,
-              "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
-        "data: [DONE]\n\n",
-    ])
-
-
-def _make_tool_call_sse(tool_calls: list[dict], clean_text: str, model: str) -> str:
-    now     = int(time.time())
-    resp_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-
+def _make_tool_call_sse(tool_calls: list[dict], clean_text: str, model: str, req_id: str, created_time: int) -> list[str]:
     def _sse(obj: dict) -> str:
         return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
     chunks = [
-        _sse({"id": resp_id, "object": "chat.completion.chunk", "created": now, "model": model,
-              "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}),
+        _sse({"id": req_id, "object": "chat.completion.chunk", "created": created_time, "model": model,
+              "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}),
     ]
     if clean_text:
         chunks.append(
-            _sse({"id": resp_id, "object": "chat.completion.chunk", "created": now, "model": model,
+            _sse({"id": req_id, "object": "chat.completion.chunk", "created": created_time, "model": model,
                   "choices": [{"index": 0, "delta": {"content": clean_text}, "finish_reason": None}]})
         )
     openai_tool_calls_delta = [
         {
             "index": i,
-            "id":    tc["id"],
-            "type":  "function",
+            "id": tc["id"],
+            "type": "function",
             "function": {
-                "name":      tc["name"],
+                "name": tc["name"],
                 "arguments": json.dumps(tc["arguments"], ensure_ascii=False),
             },
         }
         for i, tc in enumerate(tool_calls)
     ]
     chunks.append(
-        _sse({"id": resp_id, "object": "chat.completion.chunk", "created": now, "model": model,
+        _sse({"id": req_id, "object": "chat.completion.chunk", "created": created_time, "model": model,
               "choices": [{"index": 0, "delta": {"tool_calls": openai_tool_calls_delta}, "finish_reason": None}]})
     )
     chunks.append(
-        _sse({"id": resp_id, "object": "chat.completion.chunk", "created": now, "model": model,
+        _sse({"id": req_id, "object": "chat.completion.chunk", "created": created_time, "model": model,
               "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
     )
     chunks.append("data: [DONE]\n\n")
-    return "".join(chunks)
-
-
-# ── 上游流转文本 ──────────────────────────────────────────
-
-async def _collect_full_text(gen) -> str:
-    """消费 stream_cosverse_response 生成器，拼接完整文本"""
-    parts = []
-    async for chunk in gen:
-        parts.append(chunk)
-    return "".join(parts)
-
-
-# ── 配额/cookie 错误检测 ──────────────────────────────────
-
-def _is_quota_error(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return any(k in msg for k in ("quota", "limit", "429", "too many", "rate limit"))
-
-def _is_auth_error(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return any(k in msg for k in ("cookie_expired", "401", "unauthorized", "forbidden", "403"))
+    return chunks
 
 
 # ══════════════════════════════════════════════════════════
@@ -386,115 +276,75 @@ def _is_auth_error(exc: Exception) -> bool:
 
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    body     = await request.json()
-    messages = body.get("messages", [])
-    stream   = body.get("stream", False)
-    model    = body.get("model", DEFAULT_MODEL)
-    tools    = body.get("tools", [])      # OpenAI function-calling tools
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+
+    raw_messages = body.get("messages", [])
+    if not raw_messages:
+        raise HTTPException(400, "messages list cannot be empty")
+
+    stream = bool(body.get("stream", False))
+    raw_model = body.get("model", DEFAULT_MODEL)
+    tools = body.get("tools", [])
     has_tools = bool(tools)
 
-    if not messages:
-        raise HTTPException(400, "messages 不能为空")
+    real_model, _ = resolve_model(raw_model)
+    clean_messages = _convert_messages(raw_messages)
 
-    model_id, provider = resolve_model(model)
-
-    # 1. 标准化消息（tool → user，保留 list content）
-    clean_messages = _convert_messages(messages)
-
-    # 2. 图片提取与历史过滤
-    base_messages, raw_image_urls = await _extract_and_filter_images(clean_messages)
-
-    # 3. 构建纯文本 prompt（用于无图片情况或作为文字主体）
-    prompt_text = messages_to_text(base_messages)
-
-    log.info(
-        "chat | model=%s→%s stream=%s msgs=%d tools=%d images=%d",
-        model, model_id, stream, len(base_messages), len(tools), len(raw_image_urls),
-    )
-
-    # ── 内部：带配额/cookie 感知的单次尝试 ────────────────
-    async def _single_attempt(
-        acc: AccountState,
-        attempt_tools: list[dict],
-    ) -> tuple[Any, bool]:
-        """
-        执行一次上游请求。
-        返回 (result, success)：
-          - result 是 str（完整文本）或抛出异常
-        """
-        # 上传图片（绑定当前账号的 cookie）
-        cosverse_attachments: list[dict] = []
-        if raw_image_urls:
-            upload_tasks    = [upload_url_to_cosverse(u, acc) for u in raw_image_urls]
-            upload_results  = await asyncio.gather(*upload_tasks, return_exceptions=True)
-            good_results    = [r for r in upload_results if isinstance(r, dict) and r]
-            cosverse_attachments = _build_attachment_list(good_results)
-            if len(good_results) < len(raw_image_urls):
-                log.warning(
-                    "[%s] %d/%d 张图片上传失败",
-                    acc.email, len(raw_image_urls) - len(good_results), len(raw_image_urls),
-                )
-
-        # 若有工具，注入 system prompt
-        attempt_messages = list(base_messages)
-        if has_tools and attempt_tools:
-            tool_sys   = _build_tool_system_prompt(attempt_tools)
-            insert_pos = next(
-                (i + 1 for i, m in enumerate(attempt_messages) if m["role"] == "system"), 0
-            )
-            attempt_messages.insert(insert_pos, {"role": "system", "content": tool_sys})
-
-        prompt = messages_to_text(attempt_messages)
-
-        full_text = await _collect_full_text(
-            stream_cosverse_response(
-                prompt, acc,
-                model=model_id, provider=provider,
-                attachments=cosverse_attachments or None,
-            )
-        )
-        return full_text
+    req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created_time = int(time.time())
 
     # ══ 流式 ═══════════════════════════════════════════════
     if stream:
         async def sse_generator():
-            last_error: Exception = RuntimeError("未知错误")
-            current_tools         = list(tools)
-            acc: Optional[AccountState] = None
+            account = None
+            current_tools = list(tools)
+            attempt = 0
 
-            # 外层循环：MAX_RETRIES 次（含换号）
-            for attempt in range(1, MAX_RETRIES + 1):
+            while attempt < MAX_RETRIES:
+                attempt += 1
                 try:
-                    acc = await cm.get_next()
-                except HTTPException as e:
-                    yield f'data: {{"error": "无可用账号: {e.detail}"}}\n\n'
-                    return
+                    account = await cm.get_account()
 
-                try:
-                    full_text = await _single_attempt(acc, current_tools)
-
-                    # 工具调用路径
-                    if has_tools:
-                        # 截断检测
-                        is_truncated, fallback_text, next_tools = _check_truncation(
-                            full_text, tools
+                    # 若开启 tools，当请求包含工具调用系统时，为了完整捕获并格式化返回 tool_calls，做缓冲/解析
+                    # 或者常规流式正常直出
+                    attempt_messages = list(clean_messages)
+                    if has_tools and current_tools:
+                        tool_sys = _build_tool_system_prompt(current_tools)
+                        insert_pos = next(
+                            (i + 1 for i, m in enumerate(attempt_messages) if m.get("role") == "system"), 0
                         )
-                        if is_truncated:
-                            if attempt < MAX_RETRIES:
-                                current_tools = next_tools
-                                log.warning(
-                                    "stream(tools) attempt %d 工具块被截断，缩减 tools 重试",
-                                    attempt,
-                                )
-                                continue
-                            else:
-                                log.error("stream(tools) 所有尝试均被截断，降级返回过渡语")
-                                yield _plain_text_to_sse(fallback_text, model)
-                                return
+                        attempt_messages.insert(insert_pos, {"role": "system", "content": tool_sys})
+
+                    prompt = messages_to_text(attempt_messages)
+                    chat_id = str(uuid.uuid4())
+
+                    if has_tools:
+                        # 收集流式输出进行 tool_calls 探测
+                        collected_text = []
+                        last_usage = None
+                        async for chunk in stream_mantle_response(account, real_model, prompt, chat_id):
+                            if "delta" in chunk:
+                                collected_text.append(chunk["delta"])
+                            if "usage" in chunk and chunk["usage"]:
+                                last_usage = chunk["usage"]
+
+                        full_text = "".join(collected_text)
+                        if not full_text:
+                            raise EmptyResponseError("Empty stream content")
+
+                        # 截断检测
+                        is_truncated, fallback_text, next_tools = _check_truncation(full_text, tools)
+                        if is_truncated and attempt < MAX_RETRIES:
+                            current_tools = next_tools
+                            log.warning("Stream tools 调用被截断，缩减后重试...")
+                            continue
 
                         clean_text, tool_calls = _parse_tool_calls(full_text)
 
-                        # 必填参数校验
+                        # ??????
                         if tool_calls:
                             invalid = []
                             for tc in tool_calls:
@@ -503,141 +353,166 @@ async def chat_completions(request: Request):
                                     invalid.append((tc["name"], missing))
                             if invalid:
                                 if attempt < MAX_RETRIES:
-                                    log.warning(
-                                        "stream(tools) attempt %d 必填参数缺失 %s，重试",
-                                        attempt, invalid,
-                                    )
+                                    log.warning("stream(tools) attempt %d ?????? %s???", attempt, invalid)
                                     continue
                                 else:
-                                    log.error(
-                                        "stream(tools) 参数仍不完整 %s，降级返回文本", invalid
-                                    )
-                                    yield _plain_text_to_sse(clean_text or full_text, model)
-                                    return
-
-                        # 记录用量
-                        cm.record_usage(acc)
+                                    log.error("stream(tools) ?????? %s????????????", invalid)
 
                         if tool_calls:
-                            yield _make_tool_call_sse(tool_calls, clean_text, model)
-                        else:
-                            yield _plain_text_to_sse(clean_text or full_text, model)
+                            sse_chunks = _make_tool_call_sse(tool_calls, clean_text, raw_model, req_id, created_time)
+                            for c in sse_chunks:
+                                yield c
+                            await cm.report_success(account)
+                            return
+
+                        # 无工具调用，退化为普通流式文本输出
+                        header = {
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": raw_model,
+                            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
+                        }
+                        yield f"data: {json.dumps(header, ensure_ascii=False)}\n\n"
+
+                        content_chunk = {
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": raw_model,
+                            "choices": [{"index": 0, "delta": {"content": full_text}, "finish_reason": None}]
+                        }
+                        yield f"data: {json.dumps(content_chunk, ensure_ascii=False)}\n\n"
+
+                        finish_chunk = {
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": raw_model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                            "usage": last_usage
+                        }
+                        yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        await cm.report_success(account)
                         return
 
-                    # 普通流式——逐块 yield
-                    # 已拿到完整文本，转换成 SSE 流输出
-                    resp_id = f"chatcmpl-{uuid.uuid4().hex}"
-                    created = int(time.time())
+                    else:
+                        # 纯对话标准实时流式直出
+                        first_chunk = True
+                        has_yielded = False
+                        async for chunk in stream_mantle_response(account, real_model, prompt, chat_id):
+                            if first_chunk:
+                                header_data = {
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created_time,
+                                    "model": raw_model,
+                                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
+                                }
+                                yield f"data: {json.dumps(header_data, ensure_ascii=False)}\n\n"
+                                first_chunk = False
 
-                    def _sse(obj: dict) -> str:
-                        return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+                            if "delta" in chunk:
+                                has_yielded = True
+                                chunk_data = {
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created_time,
+                                    "model": raw_model,
+                                    "choices": [{"index": 0, "delta": {"content": chunk["delta"]}, "finish_reason": None}]
+                                }
+                                yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
 
-                    yield _sse({"id": resp_id, "object": "chat.completion.chunk",
-                                "created": created, "model": model,
-                                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""},
-                                             "finish_reason": None}]})
-                    # 分块输出，每次最多 200 字符，保持流式体验
-                    text = full_text
-                    chunk_size = 200
-                    for i in range(0, max(len(text), 1), chunk_size):
-                        piece = text[i:i + chunk_size]
-                        yield _sse({"id": resp_id, "object": "chat.completion.chunk",
-                                    "created": created, "model": model,
-                                    "choices": [{"index": 0, "delta": {"content": piece},
-                                                 "finish_reason": None}]})
-                    yield _sse({"id": resp_id, "object": "chat.completion.chunk",
-                                "created": created, "model": model,
-                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
-                    yield "data: [DONE]\n\n"
+                            if "finish_reason" in chunk:
+                                end_data = {
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created_time,
+                                    "model": raw_model,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": chunk["finish_reason"]}],
+                                    "usage": chunk.get("usage")
+                                }
+                                yield f"data: {json.dumps(end_data, ensure_ascii=False)}\n\n"
 
-                    cm.record_usage(acc)
-                    return
-
-                except PermissionError as e:
-                    # cookie 过期
-                    last_error = e
-                    log.warning("stream attempt %d cookie 过期 [%s]，换号重试", attempt, acc.email)
-                    try:
-                        # ★ 增加 attempt=attempt 传参
-                        acc = await cm.mark_failed_and_get_replacement(acc, "cookie_expired", attempt=attempt)
-                    except HTTPException as he:
-                        yield f'data: {{"error": "换号失败: {he.detail}"}}\n\n'
+                        yield "data: [DONE]\n\n"
+                        await cm.report_success(account)
                         return
 
                 except Exception as e:
-                    last_error = e
-                    if acc and (acc.quota_exhausted or _is_quota_error(e)):
-                        log.warning(
-                            "stream attempt %d 配额耗尽 [%s]，换号重试", attempt, acc.email
-                        )
-                        try:
-                            # ★ 增加 attempt=attempt 传参
-                            acc = await cm.mark_failed_and_get_replacement(acc, "quota_exhausted", attempt=attempt)
-                        except HTTPException as he:
-                            yield f'data: {{"error": "换号失败: {he.detail}"}}\n\n'
-                            return
-                    elif _is_auth_error(e):
-                        log.warning(
-                            "stream attempt %d auth 错误 [%s]，换号重试",
-                            attempt, acc.email if acc else "?",
-                        )
-                        if acc:
-                            try:
-                                # ★ 增加 attempt=attempt 传参
-                                acc = await cm.mark_failed_and_get_replacement(
-                                    acc, "cookie_expired", attempt=attempt
-                                )
-                            except HTTPException as he:
-                                yield f'data: {{"error": "换号失败: {he.detail}"}}\n\n'
-                                return
+                    log.warning(f"流式调用重试 {attempt}/{MAX_RETRIES}, 账号={account.email if account else 'None'}: {e}")
+                    if account:
+                        await cm.report_failure(account, str(e))
+                    if attempt < MAX_RETRIES:
+                        await asyncio.sleep(_backoff(attempt))
                     else:
-                        log.warning("stream attempt %d/%d failed: %s", attempt, MAX_RETRIES, e)
-                        if attempt < MAX_RETRIES:
-                            await asyncio.sleep(_backoff(attempt))
-
-            traceback.print_exc()
-            yield f'data: {{"error": "{last_error}"}}\n\n'
+                        err_chunk = {
+                            "error": {
+                                "message": f"All retries failed: {e}",
+                                "type": "server_error"
+                            }
+                        }
+                        yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
 
         return StreamingResponse(
             sse_generator(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     # ══ 非流式 ═════════════════════════════════════════════
-    last_error: Exception = RuntimeError("未知错误")
-    current_tools         = list(tools)
-    acc: Optional[AccountState] = None
+    last_err = None
+    current_tools = list(tools)
 
     for attempt in range(1, MAX_RETRIES + 1):
+        account = None
         try:
-            acc = await cm.get_next()
-        except HTTPException as e:
-            return JSONResponse(
-                status_code=500,
-                content={"error": {"message": f"无可用账号: {e.detail}", "type": "no_account"}},
-            )
+            account = await cm.get_account()
 
-        try:
-            full_text = await _single_attempt(acc, current_tools)
+            attempt_messages = list(clean_messages)
+            if has_tools and current_tools:
+                tool_sys = _build_tool_system_prompt(current_tools)
+                insert_pos = next(
+                    (i + 1 for i, m in enumerate(attempt_messages) if m.get("role") == "system"), 0
+                )
+                attempt_messages.insert(insert_pos, {"role": "system", "content": tool_sys})
 
-            # 工具调用路径
+            prompt = messages_to_text(attempt_messages)
+            chat_id = str(uuid.uuid4())
+
+            collected_text = []
+            finish_reason = "stop"
+            usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+            async for chunk in stream_mantle_response(account, real_model, prompt, chat_id):
+                if "delta" in chunk:
+                    collected_text.append(chunk["delta"])
+                if "finish_reason" in chunk:
+                    finish_reason = chunk["finish_reason"]
+                if "usage" in chunk and chunk["usage"]:
+                    usage = chunk["usage"]
+
+            full_content = "".join(collected_text)
+            if not full_content:
+                raise EmptyResponseError("Empty content received")
+
+            # 工具调用检测与解析
             if has_tools:
-                is_truncated, fallback_text, next_tools = _check_truncation(full_text, tools)
-                if is_truncated:
-                    if attempt < MAX_RETRIES:
-                        current_tools = next_tools
-                        log.warning(
-                            "non-stream(tools) attempt %d 工具块被截断，缩减 tools 重试", attempt
-                        )
-                        continue
-                    else:
-                        log.error("non-stream(tools) 所有尝试均被截断，降级返回过渡语")
-                        cm.record_usage(acc)
-                        return JSONResponse(content=_make_plain_response(fallback_text, model))
+                is_truncated, fallback_text, next_tools = _check_truncation(full_content, tools)
+                if is_truncated and attempt < MAX_RETRIES:
+                    current_tools = next_tools
+                    log.warning("非流式 tools 调用被截断，缩减后重试...")
+                    continue
 
-                clean_text, tool_calls = _parse_tool_calls(full_text)
+                clean_text, tool_calls = _parse_tool_calls(full_content)
 
+                # ??????
                 if tool_calls:
                     invalid = []
                     for tc in tool_calls:
@@ -646,93 +521,42 @@ async def chat_completions(request: Request):
                             invalid.append((tc["name"], missing))
                     if invalid:
                         if attempt < MAX_RETRIES:
-                            log.warning(
-                                "non-stream(tools) attempt %d 参数不完整 %s，重试",
-                                attempt, invalid,
-                            )
+                            log.warning("non-stream(tools) attempt %d ?????? %s???", attempt, invalid)
                             continue
                         else:
-                            log.error("non-stream(tools) 参数仍不完整 %s，降级", invalid)
-                            cm.record_usage(acc)
-                            return JSONResponse(
-                                content=_make_plain_response(clean_text or full_text, model)
-                            )
+                            log.error("non-stream(tools) ?????? %s????????????", invalid)
 
-                cm.record_usage(acc)
                 if tool_calls:
+                    await cm.report_success(account)
                     return JSONResponse(
-                        content=_make_tool_call_response(tool_calls, clean_text, model)
+                        content=_make_tool_call_response(tool_calls, clean_text, raw_model, usage)
                     )
-                return JSONResponse(
-                    content=_make_plain_response(clean_text or full_text, model)
-                )
 
-            # 普通非流式
-            text = full_text.strip()
-            cm.record_usage(acc)
-            return JSONResponse(content={
-                "id":      f"chatcmpl-{uuid.uuid4().hex}",
-                "object":  "chat.completion",
-                "created": int(time.time()),
-                "model":   model,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                             "finish_reason": "stop"}],
-                "usage": {
-                    "prompt_tokens":     len(prompt_text) // 4,
-                    "completion_tokens": len(text) // 4,
-                    "total_tokens":      (len(prompt_text) + len(text)) // 4,
-                },
-            })
+            await cm.report_success(account)
 
-        except PermissionError as e:
-            last_error = e
-            log.warning("non-stream attempt %d cookie 过期 [%s]，换号重试", attempt, acc.email)
-            try:
-                # ★ 增加 attempt=attempt 传参
-                acc = await cm.mark_failed_and_get_replacement(acc, "cookie_expired", attempt=attempt)
-            except HTTPException as he:
-                return JSONResponse(
-                    status_code=500,
-                    content={"error": {"message": f"换号失败: {he.detail}", "type": "no_account"}},
-                )
-
+            return JSONResponse(
+                content={
+                    "id": req_id,
+                    "object": "chat.completion",
+                    "created": created_time,
+                    "model": raw_model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": full_content
+                        },
+                        "finish_reason": finish_reason
+                    }],
+                    "usage": usage
+                }
+            )
         except Exception as e:
-            last_error = e
-            if acc and (acc.quota_exhausted or _is_quota_error(e)):
-                log.warning(
-                    "non-stream attempt %d 配额耗尽 [%s]，换号重试", attempt, acc.email
-                )
-                try:
-                    # ★ 增加 attempt=attempt 传参
-                    acc = await cm.mark_failed_and_get_replacement(acc, "quota_exhausted", attempt=attempt)
-                except HTTPException as he:
-                    return JSONResponse(
-                        status_code=500,
-                        content={"error": {"message": f"换号失败: {he.detail}", "type": "no_account"}},
-                    )
-            elif _is_auth_error(e):
-                log.warning(
-                    "non-stream attempt %d auth 错误 [%s]，换号重试",
-                    attempt, acc.email if acc else "?",
-                )
-                if acc:
-                    try:
-                        # ★ 增加 attempt=attempt 传参
-                        acc = await cm.mark_failed_and_get_replacement(acc, "cookie_expired", attempt=attempt)
-                    except HTTPException as he:
-                        return JSONResponse(
-                            status_code=500,
-                            content={"error": {"message": f"换号失败: {he.detail}",
-                                               "type": "no_account"}},
-                        )
-            else:
-                log.warning("non-stream attempt %d/%d failed: %s", attempt, MAX_RETRIES, e)
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(_backoff(attempt))
-                else:
-                    traceback.print_exc()
+            last_err = e
+            log.warning(f"非流式调用重试 {attempt}/{MAX_RETRIES}, 账号={account.email if account else 'None'}: {e}")
+            if account:
+                await cm.report_failure(account, str(e))
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(_backoff(attempt))
 
-    return JSONResponse(
-        status_code=502,
-        content={"error": {"message": str(last_error), "type": "upstream_error"}},
-    )
+    raise HTTPException(500, f"Chat completion failed after retries: {last_err}")

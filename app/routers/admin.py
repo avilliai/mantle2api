@@ -1,17 +1,16 @@
-"""
-管理接口路由
-"""
-import concurrent.futures
+# app/routers/admin.py
+
 import asyncio
+import concurrent.futures
+import datetime
 import logging
 import os
-import time
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from app.cookie_manager import cm
 
-log    = logging.getLogger("cosverse_proxy.admin")
+log = logging.getLogger("mantle_proxy.admin")
 router = APIRouter(prefix="/admin")
 
 REGISTER_CONCURRENCY_LIMIT = max(
@@ -27,45 +26,52 @@ register_executor = concurrent.futures.ThreadPoolExecutor(
 
 def _register_worker(task_id: int) -> None:
     try:
-        import asyncio
-        from app.cosverse_client import CosverseRegister
-        result = asyncio.run(CosverseRegister().run())
+        from app.mantle_client import MantleRegister
+        result = asyncio.run(MantleRegister().run())
         if result:
-            cm.add_account(result)
-            cm.save()
-            log.info(f"🎉 注册任务-{task_id} 成功: {result['email']}")
+            acc = cm.add_account(result)
+            asyncio.run(cm.check_session(acc))
+            log.info(f"注册任务-{task_id} 成功: {result['email']}")
         else:
-            log.warning(f"💥 注册任务-{task_id} 失败")
+            log.warning(f"注册任务-{task_id} 失败")
     except Exception as e:
         log.error(f"注册 Worker-{task_id} 异常: {e}")
 
 
-def _account_summary() -> dict:
-    return {
-        "total": len(cm.accounts),
-        "alive": sum(1 for a in cm.accounts if a.healthy and not a.disabled),
-    }
-
-
 def _account_view(acc) -> dict:
     return {
-        "index":    acc.index,
-        "email":    acc.email,
-        "user_id":  acc.user_id,
+        "index": acc.index,
+        "email": acc.email,
+        "user_id": acc.user_id,
         "is_alive": acc.healthy,
         "disabled": acc.disabled,
+        "remaining": acc.remaining,
+        "message_usage": acc.message_usage,
+        "message_limit": acc.message_limit,
     }
 
 
 @router.get("/tokens/detail")
 async def get_all_tokens_detail():
-    # 直接返回 cm.get_tokens_detail()，能完美匹配前端 dashboard.html
     return cm.get_tokens_detail()
+
 
 @router.post("/tokens/refresh")
 async def tokens_refresh_all(background_tasks: BackgroundTasks):
-    background_tasks.add_task(cm.keepalive_tick)
-    return {"message": "活跃池 usage 余额探测已启动，不会扫描全量账号或自动发送 OTP"}
+    async def _task():
+        sem = asyncio.Semaphore(ADMIN_PROBE_CONCURRENCY)
+
+        async def _probe(acc):
+            async with sem:
+                await cm.check_session(acc, save=False)
+                await asyncio.sleep(0.5)
+
+        await asyncio.gather(*[_probe(acc) for acc in cm.accounts if not acc.disabled])
+        cm.last_refresh = datetime.datetime.now().strftime("%H:%M:%S")
+        await cm.async_save()
+
+    background_tasks.add_task(_task)
+    return {"message": "全量健康与配额刷新任务已在后台启动"}
 
 
 @router.post("/tokens/{idx}/refresh")
@@ -74,16 +80,19 @@ async def token_refresh_one(idx: int):
     if not acc:
         raise HTTPException(404, "账号不存在")
     alive = await cm.check_session(acc)
+    cm.last_refresh = datetime.datetime.now().strftime("%H:%M:%S")
     return {
-        "message": "usage 余额探测完成",
+        "message": "配额探测与保活完成",
         "alive": alive,
         "token": _account_view(acc),
+        "summary": cm.get_tokens_detail()["summary"],
     }
 
 
 @router.post("/tokens/bulk/refresh")
 async def tokens_bulk_refresh(req: Request, background_tasks: BackgroundTasks):
-    indexes: list[int] = (await req.json()).get("indexes", [])
+    data = await req.json()
+    indexes: list[int] = data.get("indexes", [])
     selected = [a for a in cm.accounts if a.index in indexes and not a.disabled]
 
     async def _task():
@@ -92,21 +101,23 @@ async def tokens_bulk_refresh(req: Request, background_tasks: BackgroundTasks):
         async def _probe(acc):
             async with sem:
                 await cm.check_session(acc, save=False)
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
 
         await asyncio.gather(*[_probe(acc) for acc in selected])
+        cm.last_refresh = datetime.datetime.now().strftime("%H:%M:%S")
         await cm.async_save()
 
     background_tasks.add_task(_task)
     return {
-        "message": f"已启动 {len(selected)} 个账号的 usage 余额探测",
+        "message": f"已启动 {len(selected)} 个账号的配额探测",
         "count": len(selected),
     }
 
 
 @router.post("/tokens/bulk/disable")
 async def tokens_bulk_disable(req: Request):
-    indexes: list[int] = (await req.json()).get("indexes", [])
+    data = await req.json()
+    indexes: list[int] = data.get("indexes", [])
     for acc in cm.accounts:
         if acc.index in indexes:
             acc.disabled = True
@@ -116,7 +127,8 @@ async def tokens_bulk_disable(req: Request):
 
 @router.post("/tokens/bulk/enable")
 async def tokens_bulk_enable(req: Request):
-    indexes: list[int] = (await req.json()).get("indexes", [])
+    data = await req.json()
+    indexes: list[int] = data.get("indexes", [])
     for acc in cm.accounts:
         if acc.index in indexes:
             acc.disabled = False
@@ -126,11 +138,12 @@ async def tokens_bulk_enable(req: Request):
 
 @router.post("/tokens/bulk/delete")
 async def tokens_bulk_delete(req: Request):
-    indexes: list[int] = (await req.json()).get("indexes", [])
+    data = await req.json()
+    indexes: list[int] = data.get("indexes", [])
     with cm._sync_lock:
-        before         = len(cm.accounts)
-        cm.accounts    = [a for a in cm.accounts if a.index not in indexes]
-        removed        = before - len(cm.accounts)
+        before = len(cm.accounts)
+        cm.accounts = [a for a in cm.accounts if a.index not in indexes]
+        removed = before - len(cm.accounts)
     cm.save()
     return {"removed": removed}
 
@@ -145,20 +158,23 @@ async def token_delete_one(idx: int):
 
 @router.post("/tokens/add")
 async def tokens_add(req: Request):
-    data   = await req.json()
+    data = await req.json()
     tokens = data.get("tokens", [data])
-    added  = 0
+    added = 0
     for t in tokens:
-        if cm.add_account(t):
-            added += 1
+        cm.add_account(t)
+        added += 1
     cm.save()
-    return {"added": added, "total": len(cm.accounts)}
+    return {"added": added, "skipped": 0, "total": len(cm.accounts)}
 
 
 @router.post("/register/start")
 async def register_start(req: Request):
     global register_executor
-    data  = await req.json()
+    try:
+        data = await req.json()
+    except Exception:
+        data = {}
     count = int(data.get("count", 1))
     requested_conc = int(data.get("concurrency", 1))
     conc = max(1, min(requested_conc, REGISTER_CONCURRENCY_LIMIT))
@@ -168,8 +184,7 @@ async def register_start(req: Request):
         register_executor.submit(_register_worker, i + 1)
     return {
         "message": (
-            f"成功投递 {count} 个注册任务 (并发 {conc}，"
-            f"上限 {REGISTER_CONCURRENCY_LIMIT})"
+            f"成功投放 {count} 个注册任务 (并发 {conc}，上限 {REGISTER_CONCURRENCY_LIMIT})"
         )
     }
 

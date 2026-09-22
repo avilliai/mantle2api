@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Cosverse AI 2API · 管理后台</title>
+<title>Mantle AI 2API · 管理后台</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -222,7 +222,7 @@ input[type=checkbox] { width:15px; height:15px; accent-color:var(--text); cursor
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
         <path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904 9 18.75l-.813-2.846a4.5 4.5 0 0 0-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 0 0 3.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 0 0 3.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 0 0-3.09 3.09Z"/>
       </svg>
-      Cosverse AI 2API
+      Mantle AI 2API
     </a>
     <div class="nav-links">
       <div class="nav-link active">账号池</div>
@@ -287,7 +287,7 @@ input[type=checkbox] { width:15px; height:15px; accent-color:var(--text); cursor
   <div class="config-bar">
     <div class="config-group">
       <span class="config-label">Base URL</span>
-      <input class="config-input" id="base-url" placeholder="http://localhost:8009">
+      <input class="config-input" id="base-url" placeholder="http://localhost:8008">
     </div>
     <div class="config-group">
       <span class="config-label">API Key</span>
@@ -304,11 +304,6 @@ input[type=checkbox] { width:15px; height:15px; accent-color:var(--text); cursor
       <span class="api-badge get">GET</span>
       <span class="api-url">/v1/models</span>
       <span class="api-desc">模型列表</span>
-    </div>
-    <div class="api-row">
-      <span class="api-badge post">POST</span>
-      <span class="api-url">/v1/images/generations</span>
-      <span class="api-desc">图像生成（OpenAI 格式）</span>
     </div>
     <div class="api-row">
       <span class="api-badge post">POST</span>
@@ -590,7 +585,7 @@ function renderTable() {
     else if (t.remaining === 0) badge = `<span class="badge badge-yellow"><span class="dot"></span>耗尽</span>`;
     else badge = `<span class="badge badge-green"><span class="dot dot-pulse"></span>正常</span>`;
 
-    const pct = Math.min(t.remaining / state.maxRemaining * 100, 100);
+    const limit = (t.message_limit && t.message_limit > 0) ? t.message_limit : 1500; const pct = Math.min(Math.max(0, t.remaining / limit * 100), 100);
     const barClass = t.remaining === 0 ? 'empty' : pct < 30 ? 'low' : '';
 
     return `<tr class="${rowClass}" data-idx="${t.index}">
@@ -608,7 +603,7 @@ function renderTable() {
       <td>
         <div class="remaining-cell">
           <div class="mini-bar"><div class="mini-fill ${barClass}" style="width:${pct}%"></div></div>
-          <span class="remaining-num">${t.remaining}</span>
+          <span class="remaining-num" title="???: ${t.message_usage || 0} / ${t.message_limit || 1500}">${t.remaining} <span style="font-size:10px;color:var(--text-muted);font-weight:normal">/ ${t.message_limit || 1500}</span></span>
         </div>
       </td>
       <td>
@@ -832,12 +827,31 @@ function closeModal(id) {
 
 // ── Init ──────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
-  document.getElementById('base-url').value = window.location.origin;
-  ['import-modal','register-modal'].forEach(id => {
-    document.getElementById(id).addEventListener('click', e => {
-      if (e.target === e.currentTarget) closeModal(id);
+  const savedKey = localStorage.getItem('mantle_api_key') || 'endlesswork';
+  const keyInput = document.getElementById('api-key');
+  if (keyInput) {
+    keyInput.value = savedKey;
+    keyInput.addEventListener('change', () => {
+      localStorage.setItem('mantle_api_key', keyInput.value.trim());
     });
+  }
+
+  const baseInput = document.getElementById('base-url');
+  if (baseInput) {
+    baseInput.value = window.location.origin;
+  }
+
+  ['import-modal','register-modal'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.addEventListener('click', e => {
+        if (e.target === e.currentTarget) closeModal(id);
+      });
+    }
   });
+
+  // ??????????
+  fetchData();
 });
 </script>
 </body>

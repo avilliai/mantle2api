@@ -1,59 +1,84 @@
+# app/usage_client.py
+
 import json
 import logging
 from typing import Any, Dict, Optional, Tuple
 from curl_cffi.requests import AsyncSession
-from app.action_fetcher import fetch_action_config
 
-log = logging.getLogger(__name__)
+from app.config import MANTLE_API, HTTP_PROXY
+from app.models import AccountState
+
+log = logging.getLogger("mantle_proxy.usage_client")
+IMPERSONATE = "chrome120"
 
 
-async def fetch_usage(
-    cookie_str: str, timeout: int = 15
+async def fetch_mantle_usage(
+    account: AccountState, timeout: int = 15
 ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
     """
-    ?? https://chat.cosverse.ai/usage ????????????
+    通过 https://mantle.chat/api/subscriptions/usage-status?workspaceId=... 探测账号配额与存活状态
 
-    ???:
-        (alive, limits_dict, error_message)
-        - alive ? True ?? session ??????????limits_dict ???:
-          {"messageLimit": 100, "messageUsage": 0, "claudeLimit": 0, ...}
-        - alive ? False ?????session ????????????
+    返回值:
+        (alive, usage_data, error_message)
+        - alive 为 True 表示 session 存活有效
+        - usage_data 包含:
+          {
+              "total": 1500,
+              "used": 17,
+              "available": 1483,
+              "percentage": 1.13,
+              "planType": "free",
+              "periodStartedAt": "...",
+              "resetsAt": "...",
+              "resetsInSeconds": ...
+          }
+        - alive 为 False 表示 session 已失效或请求失败
     """
-    cfg = await fetch_action_config()
+    ws = account.workspace_id
+    if not ws:
+        return False, None, f"账号 {account.email} 缺少 workspace_id"
+
     headers = {
-        "accept": "text/x-component",
+        "accept": "application/json, text/plain, */*",
         "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
-        "content-type": "text/plain;charset=UTF-8",
-        "next-action": cfg.usage_action,
-        "next-router-state-tree": cfg.router_state_usage(),
-        "priority": "u=1, i",
-        "referer": "https://chat.cosverse.ai/usage",
-        "cookie": cookie_str,
+        "x-workspace-id": ws,
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
     }
-    if cfg.deployment_id:
-        headers["x-deployment-id"] = cfg.deployment_id
+
+    url = f"{MANTLE_API}/subscriptions/usage-status?workspaceId={ws}"
 
     try:
-        async with AsyncSession(impersonate="chrome110") as session:
-            resp = await session.post(
-                "https://chat.cosverse.ai/usage",
-                headers=headers,
-                data="[]",
-                timeout=timeout,
-            )
+        async with AsyncSession(proxy=HTTP_PROXY or None, impersonate=IMPERSONATE) as session:
+            for k, v in account.cookies.items():
+                session.cookies.set(k, v, domain="mantle.chat")
 
-        if resp.status_code != 200:
-            return False, None, f"HTTP {resp.status_code}"
+            resp = await session.get(url, headers=headers, timeout=timeout)
 
-        for line in resp.text.splitlines():
-            line = line.strip()
-            if line.startswith("1:"):
-                payload = json.loads(line[2:])
-                if payload.get("success"):
-                    return True, payload.get("limits", {}), None
-                else:
-                    return False, None, payload.get("error", "Unknown error")
+        if resp.status_code == 200:
+            data = resp.json()
+            included = data.get("included", {})
+            total = int(included.get("total", 1500))
+            used = int(included.get("used", 0))
+            available = int(included.get("available", total - used))
+            percentage = float(included.get("percentage", 0.0))
 
-        return False, None, f"Unrecognized response: {resp.text[:100]}"
+            usage_info = {
+                "total": total,
+                "used": used,
+                "available": available,
+                "percentage": percentage,
+                "planType": data.get("planType", "free"),
+                "periodStartedAt": included.get("periodStartedAt"),
+                "resetsAt": included.get("resetsAt"),
+                "resetsInSeconds": included.get("resetsInSeconds"),
+            }
+            return True, usage_info, None
+        elif resp.status_code in (401, 403):
+            return False, None, f"Session 过期或未授权 (HTTP {resp.status_code})"
+        else:
+            return False, None, f"HTTP {resp.status_code}: {resp.text[:100]}"
     except Exception as e:
         return False, None, str(e)

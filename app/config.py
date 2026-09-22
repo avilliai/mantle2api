@@ -3,13 +3,16 @@
 """
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── 文件路径 ──────────────────────────────────────────────
-TOKENS_FILE = Path("./cosverse_tokens.json")
+TOKENS_FILE = Path("./mantle_tokens.json")
 
 # ── 上游地址 ──────────────────────────────────────────────
-COSVERSE_WEB = "https://chat.cosverse.ai"
-COSVERSE_API = "https://chat.cosverse.ai/api"
+MANTLE_WEB = "https://mantle.chat"
+MANTLE_API = "https://mantle.chat/api"
 
 # ── 默认 HTTP 请求头 ──────────────────────────────────────
 COMMON_HEADERS: dict[str, str] = {
@@ -23,16 +26,11 @@ COMMON_HEADERS: dict[str, str] = {
     ),
 }
 
-# ── Next.js action hashes 和 deployment_id ────────────────
-# 这些值由 Vercel 每次部署时重新生成，不能硬编码。
-# 运行时由 app/action_fetcher.py 动态从页面 JS bundle 抓取，
-# 失败时才使用 action_fetcher.py 内的 _FALLBACK 兜底值。
-
-# ── 代理（可通过环境变量覆盖） ─────────────────────────────
-HTTP_PROXY  = os.getenv("HTTP_PROXY", "")
-HTTPS_PROXY = os.getenv("HTTPS_PROXY", "")
+# ── 代理（可通过环境变量覆盖）──────────────────────────────
+HTTP_PROXY = os.getenv("HTTP_PROXY", os.getenv("PROXY", "http://127.0.0.1:10809"))
+HTTPS_PROXY = os.getenv("HTTPS_PROXY", os.getenv("PROXY", "http://127.0.0.1:10809"))
 
 if HTTP_PROXY:
-    os.environ["http_proxy"]  = HTTP_PROXY
+    os.environ["http_proxy"] = HTTP_PROXY
 if HTTPS_PROXY:
-    os.environ["https_proxy"] = HTTPS_PROXY
+    os.environ["https_proxy"] = HTTPS_PROXY
