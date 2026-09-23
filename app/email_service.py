@@ -1,10 +1,11 @@
 """
-邮箱服务类（与原项目相同）
+???????? Cloudflare Worker ???????
 """
 import os
 import requests
 import random
 import string
+from typing import Tuple, Optional
 from dotenv import load_dotenv
 
 
@@ -12,13 +13,18 @@ class EmailService:
     def __init__(self):
         load_dotenv()
         self.worker_domain  = os.getenv("WORKER_DOMAIN")
-        self.email_domain   = os.getenv("EMAIL_DOMAIN")
+        self.email_domain   = os.getenv("EMAIL_DOMAIN", "xedjwor.info")
         self.admin_password = os.getenv("ADMIN_PASSWORD")
+        self.proxy          = os.getenv("HTTP_PROXY") or os.getenv("PROXY")
 
         if not all([self.worker_domain, self.email_domain, self.admin_password]):
             raise ValueError(
                 "Missing required environment variables: WORKER_DOMAIN, EMAIL_DOMAIN, ADMIN_PASSWORD"
             )
+
+        self.session = requests.Session()
+        if self.proxy:
+            self.session.proxies = {"http": self.proxy, "https": self.proxy}
 
     def _generate_random_name(self) -> str:
         letters1 = "".join(random.choices(string.ascii_lowercase, k=random.randint(4, 6)))
@@ -26,42 +32,44 @@ class EmailService:
         letters2 = "".join(random.choices(string.ascii_lowercase, k=random.randint(0, 5)))
         return letters1 + numbers + letters2
 
-    def create_email(self):
+    def create_email(self, domain: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+        target_domain = domain or self.email_domain
         url = f"https://{self.worker_domain}/admin/new_address"
         try:
             name = self._generate_random_name()
-            res  = requests.post(
+            res = self.session.post(
                 url,
                 json={
                     "enablePrefix": True,
                     "name":         name,
-                    "domain":       self.email_domain,
+                    "domain":       target_domain,
                 },
                 headers={
                     "x-admin-auth":  self.admin_password,
                     "Content-Type":  "application/json",
                 },
-                timeout=10,
+                timeout=15,
                 verify=False
             )
             if res.status_code == 200:
                 data = res.json()
                 return data.get("jwt"), data.get("address")
-            print(f"[-] 创建邮箱接口返回错误: {res.status_code} - {res.text}")
+            print(f"[-] ??????????: {res.status_code} - {res.text}")
             return None, None
         except Exception as e:
-            print(f"[-] 创建邮箱网络异常: {e}")
+            print(f"[-] ????????: {e}")
             return None, None
 
-    def fetch_first_email(self, jwt: str):
+    def fetch_first_email(self, jwt: str) -> Optional[str]:
         try:
-            res = requests.get(
+            res = self.session.get(
                 f"https://{self.worker_domain}/api/mails",
                 params={"limit": 10, "offset": 0},
                 headers={
                     "Authorization": f"Bearer {jwt}",
                     "Content-Type":  "application/json",
                 },
+                timeout=15,
                 verify=False
             )
             if res.status_code == 200:
@@ -70,62 +78,78 @@ class EmailService:
                     return data["results"][0].get("raw")
             return None
         except Exception as e:
-            print(f"获取邮件失败: {e}")
+            print(f"??????: {e}")
             return None
 
-    def get_address_id_by_name(self, name: str) -> int | None:
-        """通过邮箱名搜索，拿到 address id"""
+    def get_address_id_by_name(self, name_or_email: str) -> Optional[int]:
+        """????????????????? address id"""
         try:
-            res = requests.get(
+            if "@" in name_or_email:
+                prefix, domain = name_or_email.split("@", 1)
+                full_address = name_or_email
+            else:
+                prefix = name_or_email
+                domain = self.email_domain
+                full_address = f"{prefix}@{domain}"
+
+            res = self.session.get(
                 f"https://{self.worker_domain}/admin/address",
-                params={"query": name, "limit": 10, "offset": 0},
+                params={"query": prefix, "limit": 20, "offset": 0},
                 headers={"x-admin-auth": self.admin_password},
-                timeout=10,
+                timeout=15,
                 verify=False
             )
             if res.status_code == 200:
                 data = res.json()
                 results = data.get("results", [])
-                # 精确匹配，避免前缀相似的误命中
-                full_address = f"{name}@{self.email_domain}"
+                # ???????????
                 for item in results:
-                    if item.get("name") == full_address or item.get("name") == name:
+                    item_name = item.get("name", "")
+                    if item_name == full_address or item_name == prefix:
                         return item.get("id")
-                print(f"[-] 未找到精确匹配: {name}，返回结果: {[r.get('name') for r in results]}")
+                # ?????????????????? prefix@ ???
+                for item in results:
+                    item_name = item.get("name", "")
+                    if item_name.startswith(f"{prefix}@"):
+                        return item.get("id")
+                print(f"[-] ???????: {name_or_email}?????: {[r.get('name') for r in results]}")
             else:
-                print(f"[-] 查询失败: {res.status_code} - {res.text}")
+                print(f"[-] ????: {res.status_code} - {res.text}")
         except Exception as e:
-            print(f"[-] 查询异常: {e}")
+            print(f"[-] ????: {e}")
         return None
 
-    def get_jwt_by_address_id(self, address_id: int) -> str | None:
-        """用 address id 直接生成 JWT，无需删除重建"""
+    def get_jwt_by_address_id(self, address_id: int) -> Optional[str]:
+        """? address id ???? JWT???????"""
         try:
-            res = requests.get(
+            res = self.session.get(
                 f"https://{self.worker_domain}/admin/show_password/{address_id}",
                 headers={"x-admin-auth": self.admin_password},
-                timeout=10,
+                timeout=15,
                 verify=False
             )
             if res.status_code == 200:
                 return res.json().get("jwt")
-            print(f"[-] 获取 JWT 失败: {res.status_code} - {res.text}")
+            print(f"[-] ?? JWT ??: {res.status_code} - {res.text}")
         except Exception as e:
-            print(f"[-] 获取 JWT 异常: {e}")
+            print(f"[-] ?? JWT ??: {e}")
         return None
 
-    def recover_email_jwt(self, name: str) -> tuple[str | None, str | None]:
+    def recover_email_jwt(self, name_or_email: str) -> Tuple[Optional[str], Optional[str]]:
         """
-        通过邮箱名恢复 JWT（用于找回之前未保存的 JWT）
-        :return: (jwt, address)
+        ???????????? JWT??????????? JWT?
+        :return: (jwt, full_address)
         """
-        address_id = self.get_address_id_by_name(name)
+        if "@" in name_or_email:
+            full_address = name_or_email
+        else:
+            full_address = f"{name_or_email}@{self.email_domain}"
+
+        address_id = self.get_address_id_by_name(name_or_email)
         if not address_id:
             return None, None
 
         jwt = self.get_jwt_by_address_id(address_id)
         if jwt:
-            address = f"{name}@{self.email_domain}"
-            print(f"[+] 成功恢复 JWT: {address}")
-            return jwt, address
+            return jwt, full_address
         return None, None

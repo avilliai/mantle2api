@@ -494,57 +494,84 @@ async def stream_mantle_response(
             raise EmptyResponseError("????????? delta ??")
 
 
-async def relogin_with_browser(email_addr: str, proxy: Optional[str] = None) -> Optional[dict]:
+async def relogin_with_curl(email_addr: str, proxy: Optional[str] = None) -> Optional[dict]:
     """
-    ????/401????????????????????? session/csrf?
-    ?????????await browser.close()??????????? 2G ?????
+    ??? curl_cffi ???? WorkOS ???????? session/csrf?
+    ??????????? Chromium/Playwright??????????? 2G ??????
     """
-    from playwright.async_api import async_playwright
-    from app.email_service import EmailService
-
-    proxy_cfg = {"server": proxy or HTTP_PROXY} if (proxy or HTTP_PROXY) else None
+    proxy_url = proxy or HTTP_PROXY
     es = EmailService()
     name = email_addr.split("@")[0]
 
     # 1. ???? JWT
-    jwt, _ = es.recover_email_jwt(name)
+    jwt, full_addr = es.recover_email_jwt(name)
     if not jwt:
         log.error(f"[relogin] ?????? JWT: {email_addr}")
         return None
 
-    edge_paths = [
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ]
-    executable_path = None
-    for p in edge_paths:
-        if os.path.exists(p):
-            executable_path = p
-            break
+    # ??????????? OTP???????????????
+    old_raw = es.fetch_first_email(jwt)
+    old_code = None
+    if old_raw:
+        m = re.findall(r"\b\d{6}\b", old_raw)
+        if m:
+            old_code = m[0]
 
-    browser = None
     try:
-        async with async_playwright() as p:
-            launch_kwargs = {"headless": True, "proxy": proxy_cfg}
-            if executable_path:
-                launch_kwargs["executable_path"] = executable_path
+        async with AsyncSession(proxy=proxy_url or None, impersonate=IMPERSONATE) as s:
+            # 1. ?? WorkOS ???
+            log.info(f"[relogin] 1. ?? WorkOS ????: {email_addr}")
+            r1 = await s.get(
+                "https://mantle.chat/api/auth/workos/login?provider=authkit&returnUrl=%2Fchat",
+                allow_redirects=True,
+                timeout=30,
+            )
+            if r1.status_code >= 400:
+                log.error(f"[relogin] WorkOS ???????: HTTP {r1.status_code}")
+                return None
 
-            browser = await p.chromium.launch(**launch_kwargs)
-            context = await browser.new_context()
-            page = await context.new_page()
+            parsed = urlparse(r1.url)
+            qs = parse_qs(parsed.query)
+            client_id = qs.get("client_id", [""])[0]
+            redirect_uri = qs.get("redirect_uri", [""])[0]
+            state = qs.get("state", [""])[0]
+            session_id = qs.get("authorization_session_id", [""])[0]
 
-            log.info(f"[relogin] ????????: {email_addr}")
-            await page.goto("https://mantle.chat/login", wait_until="load", timeout=25000)
+            if not session_id or not redirect_uri:
+                log.error(f"[relogin] ?? session_id ? redirect_uri: {r1.url}")
+                return None
 
-            btn = page.get_by_text("Continue with email")
-            await btn.click()
+            # 2. ????
+            log.info(f"[relogin] 2. ????? AuthKit: {email_addr}")
+            mime = CurlMime()
+            mime.addpart(name="_1_email", data=email_addr.encode("utf-8"))
+            mime.addpart(name="_1_redirect_uri", data=redirect_uri.encode("utf-8"))
+            mime.addpart(name="_1_authorization_session_id", data=session_id.encode("utf-8"))
+            mime.addpart(name="_1_state", data=state.encode("utf-8"))
+            mime.addpart(name="0", data=b'["$K1"]')
 
-            email_inp = page.locator('input[type="email"]')
-            await email_inp.wait_for(timeout=15000)
-            await email_inp.fill(email_addr)
-            await page.keyboard.press("Enter")
+            headers_submit = {
+                "Next-Action": "409dfdd69397fa9f326db3612977e0aa51bada7cdb",
+                "Accept": "text/x-component",
+                "Referer": r1.url,
+                "Origin": f"{parsed.scheme}://{parsed.netloc}",
+            }
 
-            # 2. ???? OTP ??
+            r2 = await s.post(r1.url, multipart=mime, headers=headers_submit, timeout=30)
+            redir = r2.headers.get("x-action-redirect", "")
+            if not redir:
+                log.error(f"[relogin] ??????????: status={r2.status_code}")
+                return None
+
+            redir_path = redir.split(";")[0]
+            redir_qs = parse_qs(urlparse(redir_path).query)
+            challenge_id = redir_qs.get("authentication_challenge_id", [""])[0]
+            radar_id = redir_qs.get("radar_auth_attempt_id", [""])[0]
+            radar_created_at = redir_qs.get("radar_auth_attempt_created_at", [""])[0]
+            magic_state = redir_qs.get("state", [""])[0]
+
+            # 3. ??????
+            log.info(f"[relogin] 3. ?? OTP ???: {email_addr}...")
             code = None
             for _ in range(25):
                 await asyncio.sleep(2)
@@ -552,7 +579,7 @@ async def relogin_with_browser(email_addr: str, proxy: Optional[str] = None) -> 
                     raw_mail = es.fetch_first_email(jwt)
                     if raw_mail:
                         m = re.findall(r"\b\d{6}\b", raw_mail)
-                        if m:
+                        if m and m[0] != old_code:
                             code = m[0]
                             log.info(f"[relogin] ???? OTP ???: {code}")
                             break
@@ -560,47 +587,64 @@ async def relogin_with_browser(email_addr: str, proxy: Optional[str] = None) -> 
                     log.debug(f"[relogin] ??????: {e}")
 
             if not code:
-                log.error(f"[relogin] ???? OTP ?????: {email_addr}")
-                await browser.close()
+                log.error(f"[relogin] ?? OTP ?????: {email_addr}")
                 return None
 
-            # 3. ?????
-            await page.wait_for_url("**/magic-code*", timeout=15000)
-            await asyncio.sleep(1)
+            # 4. ?????
+            log.info("[relogin] 4. ?? OTP ???...")
+            mime_otp = CurlMime()
+            mime_otp.addpart(name="_1_code", data=code.encode("utf-8"))
+            mime_otp.addpart(name="_1_redirect_uri", data=redirect_uri.encode("utf-8"))
+            mime_otp.addpart(name="_1_authorization_session_id", data=session_id.encode("utf-8"))
+            mime_otp.addpart(name="_1_state", data=magic_state.encode("utf-8"))
+            mime_otp.addpart(name="_1_email", data=email_addr.encode("utf-8"))
+            mime_otp.addpart(name="_1_authentication_challenge_id", data=challenge_id.encode("utf-8"))
+            mime_otp.addpart(name="_1_radar_auth_attempt_id", data=radar_id.encode("utf-8"))
+            mime_otp.addpart(name="_1_radar_auth_attempt_created_at", data=radar_created_at.encode("utf-8"))
+            mime_otp.addpart(name="0", data=b'["$K1"]')
 
-            first_box = page.locator('input[data-index="0"]')
-            await first_box.click()
-            await first_box.press_sequentially(code, delay=150)
-            await page.keyboard.press("Enter")
+            otp_url = f"{parsed.scheme}://{parsed.netloc}{redir_path}"
+            headers_otp = {
+                "Next-Action": "407aa320ed3a3d9010c11a0a290f46c737a94ddb35",
+                "Accept": "text/x-component",
+                "Referer": otp_url,
+                "Origin": f"{parsed.scheme}://{parsed.netloc}",
+            }
 
-            # 4. ??????
-            success = False
-            for _ in range(25):
-                await asyncio.sleep(1)
-                if "/chat" in page.url:
-                    success = True
-                    break
-                if "error=" in page.url:
-                    log.error(f"[relogin] ??????: {page.url}")
-                    break
-
-            if not success:
-                log.error(f"[relogin] ????????? /chat: ?? URL={page.url}")
-                await browser.close()
+            r3 = await s.post(otp_url, multipart=mime_otp, headers=headers_otp, timeout=30)
+            if r3.status_code != 200:
+                log.error(f"[relogin] ???????: HTTP {r3.status_code}")
                 return None
 
-            # 5. ?? Cookie
-            cookies_list = await context.cookies()
+            # 5. ?? clientRedirect
+            log.info("[relogin] 5. ?? AuthKit ?????...")
+            rsc_target = f"{parsed.scheme}://{parsed.netloc}/success?client_redirect_key={session_id}&_rsc"
+            r_rsc = await s.get(rsc_target, headers={"RSC": "1"}, allow_redirects=False, timeout=30)
+
+            match = re.search(r'"clientRedirect":"([^"]+)"', r_rsc.text)
+            if not match:
+                log.error("[relogin] AuthKit RSC ?????? clientRedirect")
+                return None
+
+            client_redirect_url = match.group(1).encode("utf-8").decode("unicode_escape")
+
+            # 6. ?????????? Session Cookie
+            log.info("[relogin] 6. Mantle ????...")
+            r_cb = await s.get(client_redirect_url, allow_redirects=True, timeout=30)
+            if r_cb.status_code >= 400:
+                log.error(f"[relogin] Mantle ????: HTTP {r_cb.status_code}")
+                return None
+
             mantle_cookies = {}
-            for c in cookies_list:
-                if "mantle.chat" in c.get("domain", ""):
-                    mantle_cookies[c["name"]] = c["value"]
+            for c in s.cookies.jar:
+                if "mantle.chat" in getattr(c, "domain", ""):
+                    mantle_cookies[c.name] = c.value
 
-            csrf_token = mantle_cookies.get("mantle-csrf-token", "")
-
-            # 6. ????????? 2G ??
-            await browser.close()
-            browser = None
+            # ?? csrf_token
+            r_csrf = await s.get(f"{MANTLE_API}/auth/csrf", timeout=15)
+            csrf_token = r_csrf.json().get("csrfToken", "") if r_csrf.status_code == 200 else ""
+            if not csrf_token:
+                csrf_token = mantle_cookies.get("mantle-csrf-token", "")
 
             log.info(f"[relogin] ??????! Email={email_addr}")
             return {
@@ -608,11 +652,9 @@ async def relogin_with_browser(email_addr: str, proxy: Optional[str] = None) -> 
                 "csrf_token": csrf_token,
             }
     except Exception as e:
-        log.error(f"[relogin] ??????: {email_addr} - {e}", exc_info=True)
+        log.error(f"[relogin] ?????????: {email_addr} - {e}", exc_info=True)
         return None
-    finally:
-        if browser:
-            try:
-                await browser.close()
-            except Exception:
-                pass
+
+
+# ????
+relogin_with_browser = relogin_with_curl
