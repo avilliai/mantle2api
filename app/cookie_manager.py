@@ -347,17 +347,64 @@ class CookieManager:
         else:
             self.save()
 
+    async def _relogin_account(self, account: AccountState) -> bool:
+        """
+        ?????401?Token???????????????????Session?
+        ?????????????????? 2G ???????
+        """
+        try:
+            from app.mantle_client import relogin_with_browser
+            log.info(f"?? ?????????????: {account.email}")
+            result = await relogin_with_browser(account.email)
+            if result and result.get("cookies"):
+                account.cookies = result["cookies"]
+                if result.get("csrf_token"):
+                    account.csrf_token = result["csrf_token"]
+                account.fail_count = 0
+                account.healthy = True
+                self.save()
+                log.info(f"? ??????????: {account.email}")
+                # ???? usage ??
+                await self.check_session(account)
+                return True
+            else:
+                log.warning(f"? ????????: {account.email}")
+                return False
+        except Exception as e:
+            log.error(f"? ????????: {account.email} - {e}", exc_info=True)
+            return False
+
     async def report_failure(self, account: AccountState, reason: str = ""):
-        # ?????????????
+        # 1. ??????
         if "quota" in reason.lower() or "limit" in reason.lower() or "exhausted" in reason.lower():
             await self.handle_quota_exhausted(account)
             return
 
+        # 2. ???? / 401 / Token???????????
+        is_auth_error = any(k in reason.lower() for k in ["401", "authentication required", "unauthorized", "token"])
+        if is_auth_error:
+            log.warning(f"?? ?? [{account.email}] ????/401???????????...")
+            # ???????????
+            async def _bg_relogin():
+                success = await self._relogin_account(account)
+                if not success:
+                    account.fail_count += 1
+                    if account.fail_count >= FAIL_THRESHOLD:
+                        account.healthy = False
+                        with self._sync_lock:
+                            if account.index in self.active_pool:
+                                self.active_pool.remove(account.index)
+                        asyncio.create_task(self._replenish_active_pool())
+                    self.save()
+            asyncio.create_task(_bg_relogin())
+            return
+
+        # 3. ??????
         account.fail_count += 1
         log.warning(f"?? {account.email} ????: {account.fail_count}/{FAIL_THRESHOLD}, ??: {reason}")
         if account.fail_count >= FAIL_THRESHOLD:
             account.healthy = False
-            log.error(f"?? {account.email} ???????????????????")
+            log.error(f"? {account.email} ??????????????")
             with self._sync_lock:
                 if account.index in self.active_pool:
                     self.active_pool.remove(account.index)

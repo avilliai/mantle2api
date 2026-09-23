@@ -492,3 +492,127 @@ async def stream_mantle_response(
 
         if not has_content:
             raise EmptyResponseError("????????? delta ??")
+
+
+async def relogin_with_browser(email_addr: str, proxy: Optional[str] = None) -> Optional[dict]:
+    """
+    ????/401????????????????????? session/csrf?
+    ?????????await browser.close()??????????? 2G ?????
+    """
+    from playwright.async_api import async_playwright
+    from app.email_service import EmailService
+
+    proxy_cfg = {"server": proxy or HTTP_PROXY} if (proxy or HTTP_PROXY) else None
+    es = EmailService()
+    name = email_addr.split("@")[0]
+
+    # 1. ???? JWT
+    jwt, _ = es.recover_email_jwt(name)
+    if not jwt:
+        log.error(f"[relogin] ?????? JWT: {email_addr}")
+        return None
+
+    edge_paths = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    executable_path = None
+    for p in edge_paths:
+        if os.path.exists(p):
+            executable_path = p
+            break
+
+    browser = None
+    try:
+        async with async_playwright() as p:
+            launch_kwargs = {"headless": True, "proxy": proxy_cfg}
+            if executable_path:
+                launch_kwargs["executable_path"] = executable_path
+
+            browser = await p.chromium.launch(**launch_kwargs)
+            context = await browser.new_context()
+            page = await context.new_page()
+
+            log.info(f"[relogin] ????????: {email_addr}")
+            await page.goto("https://mantle.chat/login", wait_until="load", timeout=25000)
+
+            btn = page.get_by_text("Continue with email")
+            await btn.click()
+
+            email_inp = page.locator('input[type="email"]')
+            await email_inp.wait_for(timeout=15000)
+            await email_inp.fill(email_addr)
+            await page.keyboard.press("Enter")
+
+            # 2. ???? OTP ??
+            code = None
+            for _ in range(25):
+                await asyncio.sleep(2)
+                try:
+                    raw_mail = es.fetch_first_email(jwt)
+                    if raw_mail:
+                        m = re.findall(r"\b\d{6}\b", raw_mail)
+                        if m:
+                            code = m[0]
+                            log.info(f"[relogin] ???? OTP ???: {code}")
+                            break
+                except Exception as e:
+                    log.debug(f"[relogin] ??????: {e}")
+
+            if not code:
+                log.error(f"[relogin] ???? OTP ?????: {email_addr}")
+                await browser.close()
+                return None
+
+            # 3. ?????
+            await page.wait_for_url("**/magic-code*", timeout=15000)
+            await asyncio.sleep(1)
+
+            first_box = page.locator('input[data-index="0"]')
+            await first_box.click()
+            await first_box.press_sequentially(code, delay=150)
+            await page.keyboard.press("Enter")
+
+            # 4. ??????
+            success = False
+            for _ in range(25):
+                await asyncio.sleep(1)
+                if "/chat" in page.url:
+                    success = True
+                    break
+                if "error=" in page.url:
+                    log.error(f"[relogin] ??????: {page.url}")
+                    break
+
+            if not success:
+                log.error(f"[relogin] ????????? /chat: ?? URL={page.url}")
+                await browser.close()
+                return None
+
+            # 5. ?? Cookie
+            cookies_list = await context.cookies()
+            mantle_cookies = {}
+            for c in cookies_list:
+                if "mantle.chat" in c.get("domain", ""):
+                    mantle_cookies[c["name"]] = c["value"]
+
+            csrf_token = mantle_cookies.get("mantle-csrf-token", "")
+
+            # 6. ????????? 2G ??
+            await browser.close()
+            browser = None
+
+            log.info(f"[relogin] ??????! Email={email_addr}")
+            return {
+                "cookies": mantle_cookies,
+                "csrf_token": csrf_token,
+            }
+    except Exception as e:
+        log.error(f"[relogin] ??????: {email_addr} - {e}", exc_info=True)
+        return None
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
